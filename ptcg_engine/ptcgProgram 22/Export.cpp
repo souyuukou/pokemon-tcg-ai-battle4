@@ -673,6 +673,7 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
   j.appendCommaKeyValue("lastDepthSelectType", decision.metrics.lastDepthSelectType);
   j.appendCommaKeyValue("lastDepthTurnActionCount", decision.metrics.lastDepthTurnActionCount);
   j.appendCommaKeyValue("rootWorkers", decision.metrics.rootWorkers);
+  j.appendCommaKeyValue("maxConcurrentSearchThreads", ExactGlobalThreadBudget().peak());
   j.appendCommaKey("rootQueueLeases"); AppendUnsignedLongLong(j, decision.metrics.rootQueueLeases);
   j.appendCommaKey("rootQueueReassignments"); AppendUnsignedLongLong(j, decision.metrics.rootQueueReassignments);
   j.appendCommaKey("rootQueueSteals"); AppendUnsignedLongLong(j, decision.metrics.rootQueueSteals);
@@ -1168,6 +1169,7 @@ struct ExactTurnSession {
         output->planner = std::make_unique<ExactPlanner>(deck, handValues, deckCount, budgetMilliseconds,
           opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount, sharedTable, evaluator);
 		output->planner->setConcreteWorldCaching(true);
+		output->planner->setChanceParallelEnabled(false);
 		output->actions.resize(source.options.size());
 		std::vector<bool> structurallyBlocked(source.options.size(), false);
 		std::vector<int> assigned = workerAssignments[parity];
@@ -1240,7 +1242,9 @@ struct ExactTurnSession {
 		}
         return output;
       };
-      auto future0 = std::async(std::launch::async, run, 0);
+	  auto rootLease0 = ExactGlobalThreadBudget().acquire();
+	  auto rootLease1 = ExactGlobalThreadBudget().acquire();
+	  auto future0 = std::async(std::launch::async, run, 0);
       auto future1 = std::async(std::launch::async, run, 1);
       workers[0] = future0.get(); workers[1] = future1.get();
 	  std::unordered_map<int, ExactScore> representativeScores;
@@ -1367,6 +1371,14 @@ struct ExactTurnSession {
       task->planner->setConcreteWorldCaching(true);
       queue.tasks.push_back(std::move(task));
     }
+	// Reserve the complete root budget before starting either async worker.  A
+	// root-parallel session therefore leaves no permit for nested Chance async;
+	// a single representative can still use the bounded Chance path below.
+	auto rootLease0 = ExactGlobalThreadBudget().acquire();
+	ExactThreadBudget::Lease rootLease1;
+	if (queue.tasks.size() > 1) rootLease1 = ExactGlobalThreadBudget().acquire();
+	for (const auto& task : queue.tasks)
+		task->planner->setChanceParallelEnabled(queue.tasks.size() <= 1);
 
     auto runWorker = [&](int workerId) {
       while (std::chrono::steady_clock::now() < absoluteDeadline) {
@@ -1402,8 +1414,10 @@ struct ExactTurnSession {
       }
     };
     auto future0 = std::async(std::launch::async, runWorker, 0);
-    auto future1 = std::async(std::launch::async, runWorker, 1);
-    future0.get(); future1.get();
+    std::future<void> future1;
+    if (queue.tasks.size() > 1) future1 = std::async(std::launch::async, runWorker, 1);
+    future0.get();
+    if (future1.valid()) future1.get();
 
     int selectedIndex = -1, alternateIndex = -1;
     bool first = true, allCertified = true;
@@ -1654,52 +1668,9 @@ extern "C" {
     }
     try {
       SetBattleData(data, serialized, count);
-      ExactDecision decision;
-      const State& root = data->state;
-      if (root.selectMin == 1 && root.selectMax == 1 && root.options.size() > 1) {
-        struct WorkerResult { std::vector<ExactScore> actions; ExactMetrics metrics; };
-        auto sharedTable = std::make_shared<ExactSharedTransposition>();
-        auto worker = [&](int parity) {
-          WorkerResult output;
-          Game game = data->game;
-          ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds,
-            nullptr, 0, sharedTable, data->exactEvaluator);
-          for (int option = parity; option < (int)root.options.size(); option += 2) {
-            State local = root; local.game = &game;
-            ExactDecision item = planner.evaluateRootAction(local, option);
-            output.actions.push_back(item.score);
-            output.metrics = item.metrics;
-          }
-          return output;
-        };
-        auto future0 = std::async(std::launch::async, worker, 0);
-        auto future1 = std::async(std::launch::async, worker, 1);
-        WorkerResult results[2] = { future0.get(), future1.get() };
-        decision.metrics.rootWorkers = 2;
-        bool first = true, allCertified = true;
-        ExactFraction maxUpper = ExactFraction::integer(-100'000'000);
-        for (const WorkerResult& wr : results) {
-          for (const ExactScore& item : wr.actions) {
-          if (first || ExactCompare(item.lower, decision.score.lower) > 0
-              || (ExactCompare(item.lower, decision.score.lower) == 0 && item.action < decision.score.action)) {
-            decision.score = item; first = false;
-          }
-          if (ExactCompare(item.upper, maxUpper) > 0) maxUpper = item.upper;
-          allCertified = allCertified && item.certified;
-          }
-          MergeExactMetrics(decision.metrics, wr.metrics);
-        }
-        if (first) {
-          decision.score = {};
-        } else {
-          decision.score.upper = maxUpper;
-          decision.score.certified = allCertified && ExactCompare(decision.score.lower, decision.score.upper) == 0;
-        }
-      } else {
-        ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds,
-          nullptr, 0, nullptr, data->exactEvaluator);
-        decision = planner.decide(data->state);
-      }
+      auto session = std::make_unique<ExactTurnSession>();
+      ExactDecision decision = session->begin(data->state, deck, handValues, deckCount,
+        nullptr, 0, budgetMilliseconds, data->exactEvaluator);
       return ExactDecisionJson(data, decision);
     } catch (...) {
       data->jsonBuilder.clear();
@@ -1736,93 +1707,13 @@ extern "C" {
     }
     try {
       SetBattleData(data, serialized, count);
-      ExactDecision decision;
-      const State& root = data->state;
-      if (root.selectMin == 1 && root.selectMax == 1 && root.options.size() > 1) {
-        struct WorkerResult {
-          std::vector<std::pair<int, ExactScore>> actions;
-          ExactMetrics metrics;
-        };
-        const auto absoluteDeadline = std::chrono::steady_clock::now()
-          + std::chrono::milliseconds(std::max(1, budgetMilliseconds));
-        auto sharedTable = std::make_shared<ExactSharedTransposition>();
-        auto worker = [&](int parity) {
-          WorkerResult output;
-          Game game = data->game;
-          ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds,
-            opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount,
-            sharedTable, data->exactEvaluator);
-          std::vector<int> assigned;
-		  for (int option = parity; option < (int)root.options.size(); option += 2)
-			if (root.options[option].type == SelectOptionType::End) assigned.push_back(option);
-		  for (int option = parity; option < (int)root.options.size(); option += 2)
-			if (root.options[option].type != SelectOptionType::End) assigned.push_back(option);
-		  std::vector<ExactScore> saved(root.options.size());
-		  std::vector<bool> blocked(root.options.size(), false);
-		  for (int option : assigned) saved[option].action = { option };
-		  const int fairShare = std::max(50, budgetMilliseconds / std::max(1, (int)assigned.size()));
-		  const int steadySlice = std::min(60'000, fairShare);
-		  bool firstRound = true;
-		  while (std::chrono::steady_clock::now() < absoluteDeadline) {
-			bool pending = false, attempted = false;
-			for (int option : assigned) {
-			  if (saved[option].certified || blocked[option]) continue;
-			  pending = true;
-			  auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-				absoluteDeadline - std::chrono::steady_clock::now()).count();
-			  if (remaining <= 0) break;
-			  const int slice = (int)std::min<long long>(remaining,
-				firstRound ? std::min(1'000, fairShare) : steadySlice);
-			  planner.setBudgetMilliseconds(std::max(1, slice));
-			  State local = root; local.game = &game;
-			  unsigned long long unknownBefore = planner.currentMetrics().unknownOpponentList;
-			  ExactScore fresh = planner.evaluateRootAction(local, option).score;
-			  if (ExactCompare(fresh.lower, saved[option].lower) > 0) saved[option].lower = fresh.lower;
-			  if (ExactCompare(fresh.upper, saved[option].upper) < 0) saved[option].upper = fresh.upper;
-			  saved[option].certified = fresh.certified
-				|| ExactCompare(saved[option].lower, saved[option].upper) == 0;
-			  if (planner.currentMetrics().unknownOpponentList > unknownBefore) blocked[option] = true;
-			  attempted = true;
-			  if (planner.resourceStopped()) break;
-			}
-			firstRound = false;
-			if (!pending || !attempted || planner.resourceStopped()) break;
-		  }
-		  for (int option : assigned) output.actions.push_back({ option, saved[option] });
-		  output.metrics = planner.currentMetrics();
-          return output;
-        };
-        auto future0 = std::async(std::launch::async, worker, 0);
-        auto future1 = std::async(std::launch::async, worker, 1);
-        WorkerResult results[2] = { future0.get(), future1.get() };
-        bool first = true, allCertified = true;
-        ExactFraction maxUpper = ExactFraction::integer(-100'000'000);
-		for (const WorkerResult& result : results) {
-		  for (const auto& indexed : result.actions) {
-			ExactScore item = indexed.second;
-			item.action = { indexed.first };
-            decision.rootActions.push_back({ item.action, item.lower, item.upper, item.certified });
-            if (first || ExactCompare(item.lower, decision.score.lower) > 0
-                || (ExactCompare(item.lower, decision.score.lower) == 0 && item.action < decision.score.action)) {
-              decision.score = item; first = false;
-            }
-            if (ExactCompare(item.upper, maxUpper) > 0) maxUpper = item.upper;
-            allCertified = allCertified && item.certified;
-		  }
-          MergeExactMetrics(decision.metrics, result.metrics);
-        }
-        decision.metrics.rootWorkers = 2;
-        if (!first) {
-          decision.score.upper = maxUpper;
-          decision.score.certified = allCertified && ExactCompare(decision.score.lower, decision.score.upper) == 0;
-        }
-      } else {
-        ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds,
-            opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount,
-            nullptr, data->exactEvaluator);
-        decision = planner.decide(data->state);
-      }
-      return ExactDecisionJson(data, decision);
+      // Route the public one-shot API through the same lease-based root queue
+      // as turn sessions; no parity-based root splitter remains on this path.
+      auto session = std::make_unique<ExactTurnSession>();
+      ExactDecision queuedDecision = session->begin(data->state, deck, handValues, deckCount,
+        opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount,
+        budgetMilliseconds, data->exactEvaluator);
+      return ExactDecisionJson(data, queuedDecision);
     } catch (...) {
       data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":99}");
       return data->jsonBuilder.buf.c_str();

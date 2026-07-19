@@ -7,7 +7,7 @@ import unittest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "sample_submission"))
 sys.path.insert(0, ROOT)
 
-from cg.api import to_observation_class
+from cg.api import exact_decide, to_observation_class
 from cg.game import battle_finish, battle_select, battle_start
 from exact_solver.profile import load_profile
 from exact_solver import agent_policy
@@ -53,6 +53,10 @@ class NativeExactSmokeTest(unittest.TestCase):
                     self.assertTrue(agent_policy.last_decision["informationSetSafe"])
                     self.assertFalse(agent_policy.last_decision["hiddenInformationLeakDetected"])
                     self.assertGreater(agent_policy.last_decision["expandedNodes"], 0)
+                    one_shot = exact_decide(obs_after, list(profile.cards),
+                                           [100] * len(profile.cards), 100)
+                    self.assertGreaterEqual(int(one_shot["rootQueueLeases"]), 1)
+                    self.assertLessEqual(int(one_shot["maxConcurrentSearchThreads"]), 2)
                     break
                 if obs_after.current.turn > 0:
                     # Consume the other side's decision without inspecting its

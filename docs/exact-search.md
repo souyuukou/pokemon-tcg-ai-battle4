@@ -58,6 +58,11 @@ cursor, so another worker can continue it without regenerating completed
 outcomes. The queue priority combines the initial work estimate, remaining
 interval, consumed nodes, and deterministic tie-breakers.
 
+`ExactThreadBudget(2)` is process-wide. Root-parallel sessions reserve both
+permits before launching workers, which disables nested Chance async. A
+single-planner Chance batch acquires permits itself before spawning worker
+tasks, so the maximum concurrent exploration budget remains two.
+
 The intended RSS hard stop is 2.7 GB: approximately 1.3 GB keys/TT, 0.8 GB
 workers, 0.3 GB beliefs/policy/rational values, and 0.3 GB headroom. On Linux,
 admission reads current `/proc/self/statm` resident pages; `ru_maxrss` is used
@@ -83,6 +88,8 @@ Draws and prize takes branch by card type with remaining-copy integer weights.
 For large multi-card draws, a `MultiDrawCursor` yields one bounded count-vector
 outcome at a time and persists its composition stack across interruption;
 small continuation spaces may use the bounded legacy vector path.
+Streaming-entry accounting updates the aggregate partial-table byte count by
+delta whenever the pending outcome grows or is released.
 When an effect legally reveals the deck, prize multisets are enumerated lazily
 with hypergeometric weights and the triggering action is replayed in each
 resulting information state. A shuffled known deck is a multiset, not a sampled

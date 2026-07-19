@@ -42,6 +42,7 @@ class WorstCaseFixtureTest(unittest.TestCase):
         self.assertEqual(-1, start.errorPlayer, start.errorType)
         try:
             decision = None
+            streaming_decision = None
             for _ in range(80):
                 obs = to_observation_class(raw)
                 if obs.current.result >= 0:
@@ -53,15 +54,22 @@ class WorstCaseFixtureTest(unittest.TestCase):
                     action = main.agent(raw)
                     decision = agent_policy.last_decision
                     self.assertTrue(action)
-                    break
+                    if int(decision.get("streamingCursorGenerated", 0)) > 0:
+                        streaming_decision = decision
+                        break
             self.assertIsNotNone(decision)
+            self.assertIsNotNone(streaming_decision, "rich fixture never reached streaming draw path")
+            decision = streaming_decision
             self.assertTrue(decision["informationSetSafe"])
             self.assertFalse(decision["hiddenInformationLeakDetected"])
             self.assertLess(int(decision["peakRssBytes"]), 2_700_000_000)
             self.assertGreater(int(decision["currentRssBytes"]), 0)
             self.assertEqual(2, int(decision["rootWorkers"]))
             self.assertGreaterEqual(int(decision["rootQueueLeases"]), 1)
-            self.assertGreaterEqual(int(decision.get("streamingCursorPeakBytes", 0)), 0)
+            self.assertLessEqual(int(decision["maxConcurrentSearchThreads"]), 2)
+            self.assertGreater(int(decision["streamingCursorGenerated"]), 0)
+            self.assertGreater(int(decision["streamingCursorHits"]), 0)
+            self.assertGreater(int(decision["streamingCursorPeakBytes"]), 0)
             self.assertEqual(0, int(decision["chanceMassMismatches"]))
         finally:
             battle_finish()

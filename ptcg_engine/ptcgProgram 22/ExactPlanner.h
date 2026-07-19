@@ -12,6 +12,7 @@
 #include "ExactSkeletonDag.h"
 
 #include <chrono>
+#include <algorithm>
 #include <condition_variable>
 #include <functional>
 #include <numeric>
@@ -37,6 +38,72 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
+
+// Process-wide exploration budget.  A root worker or an active chance worker
+// must hold one permit; nested chance expansion can only acquire permits that
+// remain available, so a two-core process never creates an unbounded async
+// tree.  The peak is exported for regression tests and runtime diagnostics.
+class ExactThreadBudget {
+public:
+	class Lease {
+	public:
+		Lease() = default;
+		explicit Lease(ExactThreadBudget* owner) : owner_(owner) {}
+		Lease(const Lease&) = delete;
+		Lease& operator=(const Lease&) = delete;
+		Lease(Lease&& other) noexcept : owner_(other.owner_) { other.owner_ = nullptr; }
+		Lease& operator=(Lease&& other) noexcept {
+			if (this != &other) { release(); owner_ = other.owner_; other.owner_ = nullptr; }
+			return *this;
+		}
+		~Lease() { release(); }
+		void release() {
+			if (owner_ != nullptr) { owner_->release(); owner_ = nullptr; }
+		}
+		explicit operator bool() const { return owner_ != nullptr; }
+	private:
+		ExactThreadBudget* owner_ = nullptr;
+	};
+
+	explicit ExactThreadBudget(int maximum = 2) : maximum_(std::max(1, maximum)), available_(maximum_) {}
+
+	bool tryAcquire() {
+		int current = available_.load(std::memory_order_relaxed);
+		while (current > 0) {
+			if (available_.compare_exchange_weak(current, current - 1,
+				std::memory_order_acquire, std::memory_order_relaxed)) {
+				const int active = maximum_ - (current - 1);
+				int peak = peak_.load(std::memory_order_relaxed);
+				while (active > peak && !peak_.compare_exchange_weak(peak, active,
+					std::memory_order_relaxed, std::memory_order_relaxed)) {}
+				return true;
+			}
+		}
+		return false;
+	}
+
+	Lease tryLease() { return tryAcquire() ? Lease(this) : Lease(); }
+
+	Lease acquire() {
+		while (!tryAcquire()) std::this_thread::yield();
+		return Lease(this);
+	}
+
+	void release() { available_.fetch_add(1, std::memory_order_release); }
+	int available() const { return available_.load(std::memory_order_relaxed); }
+	int active() const { return maximum_ - available(); }
+	int peak() const { return peak_.load(std::memory_order_relaxed); }
+
+private:
+	int maximum_;
+	std::atomic<int> available_;
+	std::atomic<int> peak_{0};
+};
+
+inline ExactThreadBudget& ExactGlobalThreadBudget() {
+	static ExactThreadBudget budget(2);
+	return budget;
+}
 
 // Registers ActivateSkillEffect / AfterEffect / … so Passive scans can treat the
 // skill-pipeline frames as EffectControl instead of Opaque (P0-2).
@@ -1119,6 +1186,11 @@ public:
 		metrics.timedOut = false;
 	}
 
+	// Root-parallel sessions reserve both process-wide permits for their root
+	// tasks.  In that mode Chance expansion must remain serial inside each task;
+	// one-shot/single-root callers may opt into bounded Chance parallelism.
+	void setChanceParallelEnabled(bool enabled) { chanceParallelEnabled = enabled; }
+
 	// A second root worker may traverse the same expensive action from the
 	// opposite side. Completed descendants are shared through the immutable TT,
 	// so the two cores do not spend the deadline on the same prefix.
@@ -1612,6 +1684,7 @@ private:
 	bool v4StripPassiveOnly = false;
 	ExactPassivePayloadV4 chanceNodeBasePassive;
 	bool concreteWorldCaching = false;
+	bool chanceParallelEnabled = true;
 	// Enabled only by a future shared-frontier scheduler. Root-parity profiling
 	// showed no simultaneous claims, so allocating a flight record per node is
 	// deliberately not part of the standard cow path yet.
@@ -1622,6 +1695,15 @@ private:
 	bool singletonRevealStreaming = false;
 	unsigned long long resourceCheckCounter = 0;
 	unsigned long long nodeQuantumDeadline = std::numeric_limits<unsigned long long>::max();
+
+	void updateAccountedBytes(size_t& entryBytes, size_t newBytes) {
+		if (newBytes >= entryBytes) {
+			partialBytes += newBytes - entryBytes;
+		} else {
+			partialBytes -= std::min(partialBytes, entryBytes - newBytes);
+		}
+		entryBytes = newBytes;
+	}
 
 	bool expired() {
 		if (metrics.memoryLimitReached) return true;
@@ -4918,8 +5000,8 @@ private:
 			if (!partial.cursor.initialized) { partialMultiDraws.erase(found); return unknown(); }
 			partial.streaming = true;
 			partial.initialized = true;
-			partial.accountedBytes = resumeKey.size() + sizeof(PartialMultiDrawEntry) + partial.cursor.bytes();
-			partialBytes += partial.accountedBytes;
+			updateAccountedBytes(partial.accountedBytes,
+				resumeKey.size() + sizeof(PartialMultiDrawEntry) + partial.cursor.bytes());
 			metrics.streamingCursorHits++;
 			metrics.continuationDraws++;
 			metrics.continuationDrawClasses += types.size();
@@ -4931,9 +5013,10 @@ private:
 		}
 		const ExactWeight& total = partial.totalWeight;
 		noteWeight(total);
-		partial.accountedBytes = resumeKey.size() + sizeof(PartialMultiDrawEntry) + partial.cursor.bytes()
+		updateAccountedBytes(partial.accountedBytes,
+			resumeKey.size() + sizeof(PartialMultiDrawEntry) + partial.cursor.bytes()
 			+ partial.pendingOutcome.atomCounts.size() * sizeof(int)
-			+ partial.pendingOutcome.continuationKey.size();
+			+ partial.pendingOutcome.continuationKey.size());
 		metrics.streamingCursorPeakBytes = std::max<unsigned long long>(
 			metrics.streamingCursorPeakBytes, partial.accountedBytes);
 		auto incomplete = [&](const ExactScore* current = nullptr) {
@@ -4954,11 +5037,12 @@ private:
 				if (!partial.cursor.next(partial.pendingOutcome)) {
 					if (partial.processedWeight != total) {
 						metrics.chanceMassMismatches++; metrics.probabilityExact = false;
+						updateAccountedBytes(partial.accountedBytes, 0);
 						partialMultiDraws.erase(found); return unknown();
 					}
 					ExactScore result{ partial.completedLower, partial.completedUpper, {},
 						ExactCompare(partial.completedLower, partial.completedUpper) == 0 };
-					partialBytes -= std::min(partialBytes, partial.accountedBytes);
+					updateAccountedBytes(partial.accountedBytes, 0);
 					partialMultiDraws.erase(found); return result;
 				}
 				partial.pendingWeight = partial.pendingOutcome.weight;
@@ -4966,9 +5050,10 @@ private:
 				metrics.streamingCursorGenerated++;
 				metrics.rawOutcomes++;
 				metrics.continuationPreparedOutcomes++;
-				partial.accountedBytes = resumeKey.size() + sizeof(PartialMultiDrawEntry) + partial.cursor.bytes()
+				updateAccountedBytes(partial.accountedBytes,
+					resumeKey.size() + sizeof(PartialMultiDrawEntry) + partial.cursor.bytes()
 					+ partial.pendingOutcome.atomCounts.size() * sizeof(int)
-					+ partial.pendingOutcome.continuationKey.size();
+					+ partial.pendingOutcome.continuationKey.size());
 				metrics.streamingCursorPeakBytes = std::max<unsigned long long>(
 					metrics.streamingCursorPeakBytes, partial.accountedBytes);
 			}
@@ -4997,7 +5082,7 @@ private:
 			if (partial.processedWeight == total) {
 				ExactScore result{ partial.completedLower, partial.completedUpper, {},
 					ExactCompare(partial.completedLower, partial.completedUpper) == 0 };
-				partialBytes -= std::min(partialBytes, partial.accountedBytes);
+				updateAccountedBytes(partial.accountedBytes, 0);
 				partialMultiDraws.erase(found); return result;
 			}
 		}
@@ -5349,9 +5434,19 @@ private:
 					|| !partial.outcomeDone[i])
 					++remaining;
 			}
-				unsigned workers = std::thread::hardware_concurrency();
-				if (workers == 0) workers = 2;
-				workers = std::min(std::max(2u, workers / 4u), 4u);
+				unsigned requestedWorkers = std::thread::hardware_concurrency();
+				if (requestedWorkers == 0) requestedWorkers = 2;
+				requestedWorkers = std::min(std::max(2u, requestedWorkers / 4u), 4u);
+				std::vector<ExactThreadBudget::Lease> workerLeases;
+				if (chanceParallelEnabled) {
+					workerLeases.reserve(requestedWorkers);
+					for (unsigned w = 0; w < requestedWorkers; ++w) {
+						auto lease = ExactGlobalThreadBudget().tryLease();
+						if (!lease) break;
+						workerLeases.push_back(std::move(lease));
+					}
+				}
+				const unsigned workers = (unsigned)workerLeases.size();
 				if (remaining >= workers * 2u && workers > 1u) {
 					std::vector<size_t> todo;
 					todo.reserve(remaining);
@@ -5385,6 +5480,7 @@ private:
 						worker.setAbsoluteDeadline(sharedDeadline);
 						worker.v4PassiveDrawEnabled = v4Passive;
 						worker.v4PassiveDrawCertified = v4PassiveDrawCertified;
+						worker.chanceParallelEnabled = false;
 						worker.skeletonSharingEnabled = false;
 						worker.actor = sharedActor;
 						Game scratch;
