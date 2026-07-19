@@ -599,6 +599,8 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
   j.appendCommaKeyValue("actionValueCertified", decision.actionValueCertified);
   j.appendCommaKeyValue("bestActionCertified", decision.bestActionCertified);
   j.appendCommaKeyValue("exactValueCertified", decision.exactValueCertified);
+  j.appendCommaKeyValue("resumable", !decision.metrics.structurallyBlocked
+    && !decision.bestActionCertified && !decision.exactValueCertified);
   j.appendCommaKey("certificationScope");
   j.appendDoubleQuote(ExactSkeleton::CertScopeName(decision.metrics.certificationScope));
   j.appendCommaKeyValue("probabilityExact", decision.metrics.probabilityExact);
@@ -720,8 +722,9 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
   j.appendCommaKeyValue("memoryLimitReached", decision.metrics.memoryLimitReached);
   j.appendCommaKeyValue("structurallyBlocked", decision.metrics.structurallyBlocked);
   j.appendCommaKey("searchStatus");
-  j.appendDoubleQuote(decision.score.certified ? u8"certified"
-    : (decision.metrics.structurallyBlocked ? u8"blocked" : u8"resumable"));
+  j.appendDoubleQuote(decision.metrics.structurallyBlocked ? u8"blocked"
+    : (decision.exactValueCertified ? u8"certified"
+    : (decision.bestActionCertified ? u8"best_action_certified" : u8"resumable")));
 	 j.appendCommaKey("partialDecisionHits"); AppendUnsignedLongLong(j, decision.metrics.partialDecisionHits);
 	 j.appendCommaKey("partialChanceHits"); AppendUnsignedLongLong(j, decision.metrics.partialChanceHits);
 	 j.appendCommaKey("partialTableBytes"); AppendUnsignedLongLong(j, decision.metrics.partialTableBytes);
@@ -1349,13 +1352,20 @@ struct ExactTurnSession {
         if (workers[wi]->argmaxCut) decision.metrics.argmaxDominatedCuts++;
       }
 	  bool first = true;
+	  bool allRootTasksVisited = true;
 	  ExactFraction maxUpper = ExactFraction::integer(-100'000'000);
 	  ExactFraction maxOtherUpper;
 	  bool hasOtherUpper = false;
 	  int selectedWorker = 0;
 	  for (int option : orderedOptions) {
 		auto found = representativeScores.find(option);
-		if (found == representativeScores.end()) continue;
+		if (found == representativeScores.end()) {
+			allRootTasksVisited = false;
+			decision.rootActions.push_back({ { option }, ExactFraction::integer(-100'000'000),
+				ExactFraction::integer(100'000'000), false });
+			maxUpper = ExactFraction::integer(100'000'000);
+			continue;
+		}
 		ExactScore item = found->second; item.action = { option };
 		decision.rootActions.push_back({ item.action, item.lower, item.upper, item.certified });
 		if (first || ExactCompare(item.lower, decision.score.lower) > 0
@@ -1373,7 +1383,7 @@ struct ExactTurnSession {
 		decision.metrics.successorMerges++;
 		decision.metrics.largestEquivalenceClass = std::max<unsigned long long>(decision.metrics.largestEquivalenceClass, 2);
 	  }
-      decision.metrics.rootWorkers = 2;
+      decision.metrics.rootWorkers = rootLease1 ? 2 : 1;
 	  if (!first) {
 		for (const auto& item : representativeScores) {
 			if (item.second.action.empty() || item.first == decision.score.action.front()) continue;
@@ -1383,6 +1393,7 @@ struct ExactTurnSession {
 			}
 		}
 		decision.bestActionCertified = decision.metrics.informationSetSafe
+			&& allRootTasksVisited
 			&& (!hasOtherUpper || ExactCompare(decision.score.lower, maxOtherUpper) >= 0);
 		decision.actionValueCertified = decision.metrics.informationSetSafe
 			&& ExactCompare(decision.score.lower, decision.score.upper) == 0;
@@ -1587,7 +1598,7 @@ struct ExactTurnSession {
     }
 	ExactMetrics combined = alternatePolicyHit ? planner->currentMetrics() : discardedMetrics;
     MergeExactMetrics(combined, decision.metrics);
-    combined.rootWorkers = 2;
+    combined.rootWorkers = std::max(combined.rootWorkers, decision.metrics.rootWorkers);
     decision.metrics = combined;
 		lastDecision = decision;
     return decision;
@@ -1616,12 +1627,20 @@ static const char8_t* ExactProgressJson(ApiData* data, long long sessionId, cons
   j.appendCommaKey("successorMerges"); AppendUnsignedLongLong(j, metrics.successorMerges);
   j.appendCommaKey("distributionMerges"); AppendUnsignedLongLong(j, metrics.distributionMerges);
   j.appendCommaKey("sessionBytes"); AppendUnsignedLongLong(j, metrics.sessionBytes);
+	 j.appendCommaKeyValue("rootWorkers", metrics.rootWorkers);
 	 j.appendCommaKey("peakRssBytes"); AppendUnsignedLongLong(j, metrics.peakRssBytes);
 	 j.appendCommaKeyValue("memoryLimitReached", metrics.memoryLimitReached);
 	 j.appendCommaKeyValue("structurallyBlocked", metrics.structurallyBlocked);
+	 j.appendCommaKeyValue("actionValueCertified", session.lastDecision.actionValueCertified);
+	 j.appendCommaKeyValue("bestActionCertified", session.lastDecision.bestActionCertified);
+	 j.appendCommaKeyValue("exactValueCertified", session.lastDecision.exactValueCertified);
+	 j.appendCommaKeyValue("resumable", !metrics.structurallyBlocked
+		&& !session.lastDecision.bestActionCertified
+		&& !session.lastDecision.exactValueCertified);
 	 j.appendCommaKey("searchStatus");
-	 j.appendDoubleQuote(session.lastDecision.score.certified ? u8"certified"
-		 : (metrics.structurallyBlocked ? u8"blocked" : u8"resumable"));
+	 j.appendDoubleQuote(metrics.structurallyBlocked ? u8"blocked"
+		 : (session.lastDecision.exactValueCertified ? u8"certified"
+		 : (session.lastDecision.bestActionCertified ? u8"best_action_certified" : u8"resumable")));
   j.appendCommaKey("elapsedMilliseconds"); AppendLongLong(j, session.elapsedMilliseconds());
   j.appendCommaKeyValue("certified", session.lastDecision.score.certified);
   j.appendCommaKeyValue("probabilityExact", metrics.probabilityExact);

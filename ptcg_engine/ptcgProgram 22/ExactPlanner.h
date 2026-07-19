@@ -1293,7 +1293,10 @@ public:
 		for (const ExactPolicyEntry& candidate : it->second) {
 			if (candidate.actionTokens != selected->actionTokens
 				|| ExactCompare(candidate.score.lower, selected->score.lower) != 0
-				|| ExactCompare(candidate.score.upper, selected->score.upper) != 0) {
+				|| ExactCompare(candidate.score.upper, selected->score.upper) != 0
+				|| candidate.actionValueCertified != selected->actionValueCertified
+				|| candidate.bestActionCertified != selected->bestActionCertified
+				|| candidate.exactValueCertified != selected->exactValueCertified) {
 				// The same observation was reached with a different belief.  Until
 				// those beliefs are conditioned by a unique history, fail closed.
 				metrics.policyMisses++; return false;
@@ -1303,15 +1306,15 @@ public:
 		if (!remapAction(observed, selected->actionTokens, remapped)) { metrics.policyMisses++; return false; }
 		result.score = selected->score;
 		result.score.action = std::move(remapped);
-		result.bestActionCertified = result.score.certified;
-		result.actionValueCertified = result.score.certified;
-		result.exactValueCertified = result.score.certified;
+		result.actionValueCertified = selected->actionValueCertified;
+		result.bestActionCertified = selected->bestActionCertified;
+		result.exactValueCertified = selected->exactValueCertified;
 		metrics.policyHits++;
 		metrics.rerootCount++;
 		metrics.semanticActionRemaps++;
 		metrics.avoidedExpandedNodes += selected->subtreeExpanded;
 		result.metrics = metrics;
-		return selected->score.certified;
+		return selected->exactValueCertified && selected->score.certified;
 	}
 
 	ExactDecision resume(State root, int budgetMilliseconds) {
@@ -1382,6 +1385,9 @@ private:
 	struct ExactPolicyEntry {
 		ExactScore score;
 		std::vector<std::string> actionTokens;
+		bool actionValueCertified = false;
+		bool bestActionCertified = false;
+		bool exactValueCertified = false;
 		unsigned long long subtreeExpanded = 0;
 	};
 	struct PartialDecisionEntry {
@@ -2677,11 +2683,15 @@ private:
 		return (int)result.size() >= state.selectMin && (int)result.size() <= state.selectMax;
 	}
 
-	void rememberPolicy(const State& state, const ExactScore& score, unsigned long long subtreeExpanded) {
+	void rememberPolicy(const State& state, const ExactScore& score,
+		bool actionValueCertified, bool bestActionCertified,
+		bool exactValueCertified, unsigned long long subtreeExpanded) {
 		if (score.action.empty() && state.selectMin != 0) return;
 		if (policy.size() >= MaxPolicyEntries || policyBytes >= MaxPolicyBytes) return;
 		std::string key = observationKeyFor(state);
-		ExactPolicyEntry entry{ score, semanticAction(state, score.action), subtreeExpanded };
+		ExactPolicyEntry entry{ score, semanticAction(state, score.action),
+			actionValueCertified, bestActionCertified, exactValueCertified,
+			subtreeExpanded };
 		size_t bytes = key.size() + sizeof(ExactPolicyEntry) + 64;
 		for (const std::string& token : entry.actionTokens) bytes += token.size();
 		if (policyBytes + bytes > MaxPolicyBytes) return;
@@ -2689,7 +2699,10 @@ private:
 		for (const ExactPolicyEntry& existing : bucket) {
 			if (existing.actionTokens == entry.actionTokens
 				&& ExactCompare(existing.score.lower, entry.score.lower) == 0
-				&& ExactCompare(existing.score.upper, entry.score.upper) == 0) return;
+				&& ExactCompare(existing.score.upper, entry.score.upper) == 0
+				&& existing.actionValueCertified == entry.actionValueCertified
+				&& existing.bestActionCertified == entry.bestActionCertified
+				&& existing.exactValueCertified == entry.exactValueCertified) return;
 		}
 		policyBytes += bytes; bucket.push_back(std::move(entry));
 		metrics.policyNodes++; metrics.sessionBytes = transposition->bytes() + localTranspositionBytes
@@ -5705,6 +5718,7 @@ private:
 		unsigned long long expandedBefore = metrics.expanded;
 		ExactScore result;
 		bool first = true;
+		bool selectedActionValueCertified = false;
 		ExactFraction aggregate = maximize ? ExactFraction::integer(-100'000'000) : ExactFraction::integer(100'000'000);
 		bool allCertified = true;
 		struct SuccessorScoreEntry {
@@ -5739,7 +5753,9 @@ private:
 				else { if (ExactCompare(score.lower, aggregate) < 0) aggregate = score.lower; }
 				allCertified = allCertified && score.certified;
 				if (first || (maximize ? ExactCompare(score.lower, result.lower) > 0 : ExactCompare(score.upper, result.upper) < 0)) {
-					result = score; result.action = action; first = false;
+					result = score; result.action = action;
+					selectedActionValueCertified = score.certified;
+					first = false;
 				}
 				if (recursionDepth == 1)
 					rootActionValues.push_back({ action, score.lower, score.upper, score.certified });
@@ -5836,7 +5852,9 @@ private:
 			}
 			allCertified = allCertified && score.certified;
 			if (first || (maximize ? ExactCompare(score.lower, result.lower) > 0 : ExactCompare(score.upper, result.upper) < 0)) {
-				result = score; result.action = action; first = false;
+				result = score; result.action = action;
+				selectedActionValueCertified = score.certified;
+				first = false;
 			}
 			return !expired();
 		});
@@ -5847,12 +5865,16 @@ private:
 			else result.lower = ExactFraction::integer(-100'000'000);
 			result.certified = false;
 			metrics.partialDecisionNodes++;
-			if (!singletonRevealStreaming) rememberPolicy(state, result, metrics.expanded - expandedBefore);
+			if (!singletonRevealStreaming) rememberPolicy(state, result,
+				selectedActionValueCertified, false, false,
+				metrics.expanded - expandedBefore);
 			return result;
 		}
 		if (maximize) result.upper = aggregate; else result.lower = aggregate;
 		result.certified = allCertified && ExactCompare(result.lower, result.upper) == 0;
-		if (!singletonRevealStreaming) rememberPolicy(state, result, metrics.expanded - expandedBefore);
+		if (!singletonRevealStreaming) rememberPolicy(state, result,
+			selectedActionValueCertified, result.certified, result.certified,
+			metrics.expanded - expandedBefore);
 		return result;
 	}
 

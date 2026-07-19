@@ -10,17 +10,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sanitizer: [address, undefined, thread]
+        include:
+          - sanitizer: address
+            flags: -fsanitize=address
+          - sanitizer: undefined
+            flags: -fsanitize=undefined
+          - sanitizer: thread
+            flags: -fsanitize=thread
     env:
-      CXXFLAGS: >-
-        -O1 -g -fno-omit-frame-pointer
-        ${{ matrix.sanitizer == 'thread' && '-fsanitize=thread' ||
-           matrix.sanitizer == 'undefined' && '-fsanitize=undefined' ||
-           '-fsanitize=address' }}
+      SANITIZER_FLAGS: ${{ matrix.flags }}
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -S boundary_ai -B build/ci-${{ matrix.sanitizer }} -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+        run: >-
+          cmake -S boundary_ai -B build/ci-${{ matrix.sanitizer }}
+          -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+          -DCMAKE_CXX_FLAGS="-O1 -g -fno-omit-frame-pointer ${SANITIZER_FLAGS}"
+          -DCMAKE_EXE_LINKER_FLAGS="${SANITIZER_FLAGS}"
       - name: Build
         run: cmake --build build/ci-${{ matrix.sanitizer }} --parallel 2
       - name: Test
@@ -34,12 +40,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Configure
+      - name: Configure Release
         run: cmake -S boundary_ai -B build/ci-release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
-      - name: Build and test
-        run: |
-          cmake --build build/ci-release --parallel 2
-          ctest --test-dir build/ci-release --output-on-failure
+      - name: Build
+        run: cmake --build build/ci-release --parallel 2
+      - name: Test
+        run: ctest --test-dir build/ci-release --output-on-failure
 
   windows-msvc:
     runs-on: windows-latest
@@ -51,6 +57,15 @@ jobs:
         run: |
           cmake --build build/ci-msvc --config Debug --parallel 2
           ctest --test-dir build/ci-msvc -C Debug --output-on-failure
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Python regression dependency
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check --no-input numpy
       - name: Build native submission DLL
         shell: pwsh
         run: |
