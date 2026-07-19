@@ -28,5 +28,10 @@ python -m unittest discover -s sample_submission/tests -v
 Regenerate the compact replay priors:
 
 ```powershell
-python tools/build_deck_library.py --files 2000 --decks 256
+python tools/build_deck_library.py --files 10000 --decks 256
 ```
+
+The checked-in `deck_library.json` and `policy_table.json` were regenerated
+from 10,000 replay JSON files with Laplace-smoothed action frequencies.  The
+learner is streaming: it keeps only one replay and compact counters in memory,
+so it remains suitable for the 3 GB runtime limit.
