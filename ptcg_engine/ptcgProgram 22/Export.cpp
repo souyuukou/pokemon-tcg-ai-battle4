@@ -11,6 +11,7 @@
 #include <future>
 #include <atomic>
 #include <mutex>
+#include <cmath>
 
 #ifdef _MSC_VER
 #	define GAME_API __declspec(dllexport)
@@ -51,6 +52,9 @@ extern "C" GAME_API const char8_t* ExactLoadEvaluatorModel(ApiData* data, const 
   j.appendCommaKeyValue("schemaVersion", schema);
   j.appendCommaKeyValue("evaluatorVersion", evaluatorVersion);
   j.appendCommaKeyValue("informationSetSafe", informationSetSafe);
+  j.appendCommaKey("featureSchemaHash"); AppendUnsignedLongLong(j, ExactFeatureSchemaHash);
+  j.appendCommaKey("beliefSchemaHash"); AppendUnsignedLongLong(j, ExactBeliefSchemaHash);
+  j.appendCommaKeyValue("boundaryOnly", informationSetSafe);
   j.appendCommaKey("modelHash"); AppendUnsignedLongLong(j, modelHash);
   j.appendCommaKey("residentBytes"); AppendUnsignedLongLong(j, residentBytes);
   j.appendCommaKey("error");
@@ -669,6 +673,9 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
   j.appendCommaKeyValue("lastDepthSelectType", decision.metrics.lastDepthSelectType);
   j.appendCommaKeyValue("lastDepthTurnActionCount", decision.metrics.lastDepthTurnActionCount);
   j.appendCommaKeyValue("rootWorkers", decision.metrics.rootWorkers);
+  j.appendCommaKey("rootQueueLeases"); AppendUnsignedLongLong(j, decision.metrics.rootQueueLeases);
+  j.appendCommaKey("rootQueueReassignments"); AppendUnsignedLongLong(j, decision.metrics.rootQueueReassignments);
+  j.appendCommaKey("rootQueueSteals"); AppendUnsignedLongLong(j, decision.metrics.rootQueueSteals);
   j.appendCommaKey("policyNodes"); AppendUnsignedLongLong(j, decision.metrics.policyNodes);
   j.appendCommaKey("policyHits"); AppendUnsignedLongLong(j, decision.metrics.policyHits);
   j.appendCommaKey("policyMisses"); AppendUnsignedLongLong(j, decision.metrics.policyMisses);
@@ -695,6 +702,7 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	 j.appendCommaKey("partialRevealHits"); AppendUnsignedLongLong(j, decision.metrics.partialRevealHits);
 	 j.appendCommaKey("enumeratedHiddenWorlds"); AppendUnsignedLongLong(j, decision.metrics.enumeratedHiddenWorlds);
 	 j.appendCommaKeyValue("currentRootAction", decision.metrics.currentRootAction);
+	 j.appendCommaKey("currentRssBytes"); AppendUnsignedLongLong(j, decision.metrics.currentRssBytes);
 	 j.appendCommaKey("peakRssBytes"); AppendUnsignedLongLong(j, decision.metrics.peakRssBytes);
   j.appendCommaKeyValue("memoryLimitReached", decision.metrics.memoryLimitReached);
   j.appendCommaKeyValue("structurallyBlocked", decision.metrics.structurallyBlocked);
@@ -732,6 +740,10 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	 j.appendCommaKey("continuationDrawOutcomes"); AppendUnsignedLongLong(j, decision.metrics.continuationDrawOutcomes);
 	 j.appendCommaKey("continuationCompletedOutcomeNodes"); AppendUnsignedLongLong(j, decision.metrics.continuationCompletedOutcomeNodes);
 	 j.appendCommaKey("continuationMaxOutcomeNodes"); AppendUnsignedLongLong(j, decision.metrics.continuationMaxOutcomeNodes);
+	 j.appendCommaKey("streamingCursorHits"); AppendUnsignedLongLong(j, decision.metrics.streamingCursorHits);
+	 j.appendCommaKey("streamingCursorResumes"); AppendUnsignedLongLong(j, decision.metrics.streamingCursorResumes);
+	 j.appendCommaKey("streamingCursorGenerated"); AppendUnsignedLongLong(j, decision.metrics.streamingCursorGenerated);
+	 j.appendCommaKey("streamingCursorPeakBytes"); AppendUnsignedLongLong(j, decision.metrics.streamingCursorPeakBytes);
 	j.appendCommaKey("continuationAtomsMerged"); AppendUnsignedLongLong(j, decision.metrics.continuationAtomsMerged);
 	j.appendCommaKey("v4SemanticEvaluations"); AppendUnsignedLongLong(j, decision.metrics.v4SemanticEvaluations);
 	j.appendCommaKey("v4PassiveEvaluations"); AppendUnsignedLongLong(j, decision.metrics.v4PassiveEvaluations);
@@ -861,8 +873,11 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.exactWeightInlineOps += from.exactWeightInlineOps;
 	into.exactWeightSpills += from.exactWeightSpills;
 	into.evaluatorAccumulatorHits += from.evaluatorAccumulatorHits;
-	into.runtimeVersion = std::max(into.runtimeVersion, from.runtimeVersion);
-	into.canonicalSchemaVersion = std::max(into.canonicalSchemaVersion, from.canonicalSchemaVersion);
+  into.runtimeVersion = std::max(into.runtimeVersion, from.runtimeVersion);
+  into.canonicalSchemaVersion = std::max(into.canonicalSchemaVersion, from.canonicalSchemaVersion);
+  into.rootQueueLeases += from.rootQueueLeases;
+  into.rootQueueReassignments += from.rootQueueReassignments;
+  into.rootQueueSteals += from.rootQueueSteals;
   into.expanded += from.expanded; into.merged += from.merged; into.leaves += from.leaves;
   into.opaque += from.opaque; into.exceptions += from.exceptions;
   into.unknownOpponentList += from.unknownOpponentList;
@@ -892,6 +907,7 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.partialRevealHits += from.partialRevealHits;
 	into.enumeratedHiddenWorlds += from.enumeratedHiddenWorlds;
 	if (from.currentRootAction >= 0) into.currentRootAction = from.currentRootAction;
+	into.currentRssBytes = std::max(into.currentRssBytes, from.currentRssBytes);
 	into.peakRssBytes = std::max(into.peakRssBytes, from.peakRssBytes);
   into.memoryLimitReached = into.memoryLimitReached || from.memoryLimitReached;
   into.structurallyBlocked = into.structurallyBlocked || from.structurallyBlocked;
@@ -924,6 +940,10 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.continuationDrawOutcomes += from.continuationDrawOutcomes;
 	into.continuationCompletedOutcomeNodes += from.continuationCompletedOutcomeNodes;
 	into.continuationMaxOutcomeNodes = std::max(into.continuationMaxOutcomeNodes, from.continuationMaxOutcomeNodes);
+	into.streamingCursorHits += from.streamingCursorHits;
+	into.streamingCursorResumes += from.streamingCursorResumes;
+	into.streamingCursorGenerated += from.streamingCursorGenerated;
+	into.streamingCursorPeakBytes = std::max(into.streamingCursorPeakBytes, from.streamingCursorPeakBytes);
 	into.continuationAtomsMerged += from.continuationAtomsMerged;
 	into.v4SemanticEvaluations += from.v4SemanticEvaluations;
 	into.v4PassiveEvaluations += from.v4PassiveEvaluations;
@@ -1003,6 +1023,85 @@ struct ExactTurnSession {
     bool argmaxCut = false;
   };
 
+  struct RootTask {
+    int option = -1;
+    unsigned long long estimate = 1;
+    unsigned long long consumedNodes = 0;
+    ExactScore score;
+    long double intervalWidth = 200'000'000.0L;
+    std::unique_ptr<Game> game;
+    std::unique_ptr<ExactPlanner> planner;
+    bool claimed = false;
+    bool blocked = false;
+    int lastWorker = -1;
+  };
+
+  // Tasks are leased only for one bounded slice.  The planner and its partial
+  // chance cursors stay inside the task, so a later lease may be taken by the
+  // other worker without regenerating completed draw results.
+  struct RootTaskQueue {
+    std::vector<std::unique_ptr<RootTask>> tasks;
+    mutable std::mutex mutex;
+    unsigned long long leases = 0;
+    unsigned long long reassignments = 0;
+    unsigned long long steals = 0;
+
+    static long double fractionApprox(const ExactFraction& value) {
+      if (!value.valid) return 0.0L;
+      if (value.big) return 100'000'000.0L;
+      return (long double)value.numerator / (long double)value.denominator;
+    }
+
+    static long double remainingWidth(const ExactScore& score) {
+      const long double width = fractionApprox(score.upper) - fractionApprox(score.lower);
+      if (width < 0.0L || width > 200'000'000.0L) return 200'000'000.0L;
+      return width;
+    }
+
+    int acquire(int workerId) {
+      std::lock_guard<std::mutex> lock(mutex);
+      int selected = -1;
+      long double selectedPriority = -1.0L;
+      for (int i = 0; i < (int)tasks.size(); ++i) {
+        const RootTask& task = *tasks[i];
+        if (task.claimed || task.blocked || task.score.certified) continue;
+        const bool intervalOpen = ExactCompare(task.score.upper, task.score.lower) > 0;
+        const long double widthBonus = 1.0L
+          + std::min(task.intervalWidth, 200'000'000.0L) / 200'000'000.0L;
+        const long double priority = (long double)(task.estimate + 1ULL)
+          / (long double)(task.consumedNodes + 1ULL) * (intervalOpen ? 2.0L : 1.0L)
+          * widthBonus;
+        if (selected < 0 || priority > selectedPriority
+            || (priority == selectedPriority && task.option < tasks[selected]->option)) {
+          selected = i; selectedPriority = priority;
+        }
+      }
+      if (selected >= 0) {
+        RootTask& task = *tasks[selected];
+        if (task.lastWorker >= 0) {
+          ++reassignments;
+          if (task.lastWorker != workerId) ++steals;
+        }
+        task.lastWorker = workerId; task.claimed = true; ++leases;
+      }
+      return selected;
+    }
+
+    void release(int index, bool blocked) {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (index < 0 || index >= (int)tasks.size()) return;
+      tasks[index]->claimed = false;
+      tasks[index]->blocked = tasks[index]->blocked || blocked;
+    }
+
+    bool pending() const {
+      std::lock_guard<std::mutex> lock(mutex);
+      for (const auto& item : tasks)
+        if (!item->blocked && !item->score.certified) return true;
+      return false;
+    }
+  };
+
   std::unique_ptr<Game> game;
   std::unique_ptr<ExactPlanner> planner;
 	std::unique_ptr<Worker> alternateWorker;
@@ -1012,7 +1111,7 @@ struct ExactTurnSession {
 	ExactDecision lastDecision;
 	std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
 
-  ExactDecision begin(const State& source, const int* deck, const int* handValues, int deckCount,
+  ExactDecision beginFixed(const State& source, const int* deck, const int* handValues, int deckCount,
       const int* opponentDeck, int opponentDeckCount, int budgetMilliseconds,
       std::shared_ptr<const ExactCpuEvaluator> evaluator = nullptr) {
     turn = source.turn; actor = source.selectPlayer;
@@ -1219,6 +1318,141 @@ struct ExactTurnSession {
       decision = planner->decide(local);
     }
 		lastDecision = decision;
+    return decision;
+  }
+
+  ExactDecision begin(const State& source, const int* deck, const int* handValues, int deckCount,
+      const int* opponentDeck, int opponentDeckCount, int budgetMilliseconds,
+      std::shared_ptr<const ExactCpuEvaluator> evaluator = nullptr) {
+    if (!(source.selectMin == 1 && source.selectMax == 1 && source.options.size() > 1))
+      return beginFixed(source, deck, handValues, deckCount, opponentDeck, opponentDeckCount,
+        budgetMilliseconds, std::move(evaluator));
+
+    turn = source.turn; actor = source.selectPlayer;
+    started = std::chrono::steady_clock::now();
+    ExactDecision decision;
+    auto sharedTable = std::make_shared<ExactSharedTransposition>();
+    const auto absoluteDeadline = std::chrono::steady_clock::now()
+      + std::chrono::milliseconds(std::max(1, budgetMilliseconds));
+    std::vector<int> representative(source.options.size());
+    std::vector<unsigned long long> estimates(source.options.size(), 1);
+    std::unordered_map<std::string, int, ExactStringHasher> successorRepresentative;
+    for (int option = 0; option < (int)source.options.size(); ++option) {
+      Game probeGame = *source.game;
+      State probeState = source; probeState.game = &probeGame;
+      ExactPlanner probe(deck, handValues, deckCount, 1,
+        opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount, nullptr, evaluator);
+      unsigned long long estimate = 1;
+      std::string key = probe.canonicalRootSuccessor(probeState, option, &estimate);
+      auto [found, inserted] = successorRepresentative.emplace(std::move(key), option);
+      representative[option] = inserted ? option : found->second;
+      estimates[representative[option]] = std::max(estimates[representative[option]], estimate);
+    }
+    std::vector<int> orderedOptions;
+    for (int option = 0; option < (int)source.options.size(); ++option)
+      if (representative[option] == option && source.options[option].type == SelectOptionType::End)
+        orderedOptions.push_back(option);
+    for (int option = 0; option < (int)source.options.size(); ++option)
+      if (representative[option] == option && source.options[option].type != SelectOptionType::End)
+        orderedOptions.push_back(option);
+
+    RootTaskQueue queue;
+    for (int option : orderedOptions) {
+      auto task = std::make_unique<RootTask>();
+      task->option = option; task->estimate = estimates[option];
+      task->game = std::make_unique<Game>(*source.game);
+      task->planner = std::make_unique<ExactPlanner>(deck, handValues, deckCount,
+        std::max(1, std::min(500, budgetMilliseconds)),
+        opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount, sharedTable, evaluator);
+      task->planner->setConcreteWorldCaching(true);
+      queue.tasks.push_back(std::move(task));
+    }
+
+    auto runWorker = [&](int workerId) {
+      while (std::chrono::steady_clock::now() < absoluteDeadline) {
+        const int index = queue.acquire(workerId);
+        if (index < 0) {
+          if (!queue.pending()) break;
+          std::this_thread::yield();
+          continue;
+        }
+        RootTask& task = *queue.tasks[index];
+        const unsigned long long expandedBefore = task.planner->currentMetrics().expanded;
+        const unsigned long long unknownBefore = task.planner->currentMetrics().unknownOpponentList;
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+          absoluteDeadline - std::chrono::steady_clock::now()).count();
+        const int slice = (int)std::max<long long>(1, std::min<long long>(remaining, 500));
+        task.planner->setBudgetMilliseconds(slice);
+        State local = source; local.game = task.game.get();
+        ExactScore fresh = task.planner->evaluateRootAction(local, task.option).score;
+        fresh.action = { task.option };
+        if (task.score.action.empty()) task.score = fresh;
+        else {
+          if (ExactCompare(fresh.lower, task.score.lower) > 0) task.score.lower = fresh.lower;
+          if (ExactCompare(fresh.upper, task.score.upper) < 0) task.score.upper = fresh.upper;
+          if (ExactCompare(task.score.lower, task.score.upper) > 0) task.score = ExactScore{};
+          else task.score.certified = ExactCompare(task.score.lower, task.score.upper) == 0;
+          task.score.action = { task.option };
+        }
+        task.intervalWidth = RootTaskQueue::remainingWidth(task.score);
+        const unsigned long long expandedAfter = task.planner->currentMetrics().expanded;
+        task.consumedNodes += expandedAfter >= expandedBefore ? expandedAfter - expandedBefore : 0;
+        const bool blocked = task.planner->currentMetrics().unknownOpponentList > unknownBefore;
+        queue.release(index, blocked || task.planner->resourceStopped());
+      }
+    };
+    auto future0 = std::async(std::launch::async, runWorker, 0);
+    auto future1 = std::async(std::launch::async, runWorker, 1);
+    future0.get(); future1.get();
+
+    int selectedIndex = -1, alternateIndex = -1;
+    bool first = true, allCertified = true;
+    ExactFraction maxUpper = ExactFraction::integer(-100'000'000);
+    for (int option : orderedOptions) {
+      int index = -1;
+      for (int i = 0; i < (int)queue.tasks.size(); ++i)
+        if (queue.tasks[i]->option == option) { index = i; break; }
+      if (index < 0 || queue.tasks[index]->score.action.empty()) continue;
+      ExactScore item = queue.tasks[index]->score; item.action = { option };
+      decision.rootActions.push_back({ item.action, item.lower, item.upper, item.certified });
+      if (first || ExactCompare(item.lower, decision.score.lower) > 0
+          || (ExactCompare(item.lower, decision.score.lower) == 0 && item.action < decision.score.action)) {
+        if (selectedIndex >= 0) alternateIndex = selectedIndex;
+        selectedIndex = index; decision.score = item; first = false;
+      } else if (alternateIndex < 0) alternateIndex = index;
+      maxUpper = ExactCompare(item.upper, maxUpper) > 0 ? item.upper : maxUpper;
+      allCertified = allCertified && item.certified;
+    }
+    for (int option = 0; option < (int)representative.size(); ++option) {
+      if (representative[option] == option) continue;
+      int repIndex = -1;
+      for (int i = 0; i < (int)queue.tasks.size(); ++i)
+        if (queue.tasks[i]->option == representative[option]) { repIndex = i; break; }
+      if (repIndex < 0 || queue.tasks[repIndex]->score.action.empty()) continue;
+      ExactScore alias = queue.tasks[repIndex]->score; alias.action = { option };
+      decision.rootActions.push_back({ alias.action, alias.lower, alias.upper, alias.certified });
+      decision.metrics.successorMerges++;
+      decision.metrics.largestEquivalenceClass = std::max<unsigned long long>(decision.metrics.largestEquivalenceClass, 2);
+    }
+    if (!first) {
+      decision.score.upper = maxUpper;
+      decision.score.certified = allCertified && ExactCompare(decision.score.lower, decision.score.upper) == 0;
+    }
+    for (const auto& task : queue.tasks) MergeExactMetrics(decision.metrics, task->planner->currentMetrics());
+    decision.metrics.rootWorkers = 2;
+    decision.metrics.rootQueueLeases += queue.leases;
+    decision.metrics.rootQueueReassignments += queue.reassignments;
+    decision.metrics.rootQueueSteals += queue.steals;
+    if (selectedIndex >= 0) {
+      game = std::move(queue.tasks[selectedIndex]->game);
+      planner = std::move(queue.tasks[selectedIndex]->planner);
+      if (alternateIndex >= 0 && alternateIndex != selectedIndex) {
+        alternateWorker = std::make_unique<Worker>();
+        alternateWorker->game = std::move(*queue.tasks[alternateIndex]->game);
+        alternateWorker->planner = std::move(queue.tasks[alternateIndex]->planner);
+      }
+    }
+    lastDecision = decision;
     return decision;
   }
 

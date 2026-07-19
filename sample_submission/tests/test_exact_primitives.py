@@ -4,12 +4,14 @@ import os
 import sys
 import unittest
 from fractions import Fraction
+from unittest.mock import patch
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "sample_submission"))
 sys.path.insert(0, ROOT)
 
 from exact_solver.canonical import KeyArena, observation_key
 from exact_solver.chance import exact_draw_outcomes
+from exact_solver.resources import current_rss_bytes, peak_rss_bytes
 
 
 class ExactPrimitiveTest(unittest.TestCase):
@@ -36,6 +38,14 @@ class ExactPrimitiveTest(unittest.TestCase):
             {item.value: item.weight for item in outcomes},
         )
         self.assertEqual(Fraction(1), sum((item.probability for item in outcomes), Fraction()))
+
+    def test_linux_rss_uses_current_statm_not_peak_rss(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Linux/procfs-specific assertion")
+        with patch("exact_solver.resources.Path.read_text", return_value="100 7 0 0"), \
+             patch("exact_solver.resources.os.sysconf", return_value=4096):
+            self.assertEqual(7 * 4096, current_rss_bytes())
+        self.assertGreaterEqual(peak_rss_bytes(), 0)
 
 
 if __name__ == "__main__":

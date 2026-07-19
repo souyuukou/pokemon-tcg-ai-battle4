@@ -12,6 +12,7 @@
 #include "ExactPassivePayloadV4.h"
 #include "ExactSparseEvaluatorV3.h"
 #include "ExactSparseEvaluatorV4.h"
+#include "ExactEvaluatorManifest.h"
 
 enum class ExactEvaluatorVersion : unsigned char { V3 = 0, V4 = 1, Dual = 2 };
 
@@ -90,7 +91,10 @@ public:
 		return version == ExactEvaluatorVersion::Dual || ExactEnvFlagEnabled("PTCG_EXACT_V4_PASSIVE_STRIP");
 	}
 	ExactEvaluatorVersion evaluatorVersion() const { return version; }
-	bool informationSetSafe() const { return loaded; }
+	bool informationSetSafe() const {
+		return loaded && sparseV3.manifestInformationSetSafe()
+			&& (!sparseV4.isLoaded() || !sparseV4.isStandalone() || sparseV4.manifestInformationSetSafe());
+	}
 	std::uint64_t modelHash() const {
 		return usesV4Search() ? sparseV4.modelHash() : sparseV3.modelHash();
 	}

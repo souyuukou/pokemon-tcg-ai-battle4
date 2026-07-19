@@ -22,6 +22,11 @@ BELIEF_SCALE = 256
 SCORE_SCALE = 100_000_000
 NON_TERMINAL_LIMIT = 90_000_000
 HEADER = struct.Struct("<8s16I4Q32s")
+MANIFEST_MAGIC = b"PTCGMAN3"
+MANIFEST_VERSION = 1
+FEATURE_SCHEMA_HASH = 0xB694F079709A9522
+BELIEF_SCHEMA_HASH = 0xA30C8939B0A5DBB2
+MANIFEST = struct.Struct("<8sIIQQBB6s")
 
 
 def fnv1a(data: bytes) -> int:
@@ -125,8 +130,10 @@ def export_quantized(path: str | Path, model: QuantizedModel) -> None:
         np.asarray(model.global_bias, dtype="<i4"),
         np.asarray(model.output_weight, dtype="<i2"),
     )
-    Path(path).write_bytes(header + b"".join(a.tobytes(order="C") for a in arrays)
-                           + struct.pack("<q", int(model.output_bias)))
+    payload = header + b"".join(a.tobytes(order="C") for a in arrays) + struct.pack("<q", int(model.output_bias))
+    manifest = MANIFEST.pack(MANIFEST_MAGIC, MANIFEST_VERSION, VERSION,
+                             FEATURE_SCHEMA_HASH, BELIEF_SCHEMA_HASH, 1, 1, bytes(6))
+    Path(path).write_bytes(payload + manifest)
 
 
 def load_quantized(path: str | Path) -> QuantizedModel:
@@ -166,9 +173,13 @@ def load_quantized(path: str | Path) -> QuantizedModel:
     pw = take("<i2", POOLS * ENTITY_HIDDEN * GLOBAL_HIDDEN).reshape(POOLS, ENTITY_HIDDEN, GLOBAL_HIDDEN)
     gb = take("<i4", GLOBAL_HIDDEN)
     ow = take("<i2", GLOBAL_HIDDEN)
-    if offset + 8 != len(raw):
+    if offset + 8 + MANIFEST.size != len(raw):
         raise ValueError("invalid V3 payload length")
     output_bias, = struct.unpack_from("<q", raw, offset)
+    manifest = MANIFEST.unpack_from(raw, offset + 8)
+    if manifest[:5] != (MANIFEST_MAGIC, MANIFEST_VERSION, VERSION,
+                        FEATURE_SCHEMA_HASH, BELIEF_SCHEMA_HASH) or not manifest[5] or not manifest[6]:
+        raise ValueError("invalid V3 evaluator manifest")
     result = QuantizedModel(tokens, edw, esw, eb, gdw, gsw, pw, gb, ow, output_bias,
                             dataset_hash, card_checksum, effect_checksum, combo_checksum)
     result.validate()

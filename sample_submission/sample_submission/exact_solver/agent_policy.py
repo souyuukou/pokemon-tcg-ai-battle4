@@ -22,13 +22,18 @@ def _ensure_v3_evaluator() -> None:
         return
     from pathlib import Path
     from cg.api import exact_load_evaluator_model
+    from .nnue_v3 import BELIEF_SCHEMA_HASH, FEATURE_SCHEMA_HASH
     candidates = [Path(__file__).resolve().parents[1] / "exact-evaluator-v3.bin",
                   Path("/kaggle_simulations/agent/exact-evaluator-v3.bin")]
     path = next((candidate for candidate in candidates if candidate.exists()), None)
     if path is None:
         raise RuntimeError("V3 evaluator model is missing")
     info = exact_load_evaluator_model(str(path))
-    if int(info.get("schemaVersion", 0)) != 3 or not info.get("informationSetSafe"):
+    if (int(info.get("schemaVersion", 0)) != 3
+            or not info.get("informationSetSafe")
+            or not info.get("boundaryOnly")
+            or int(info.get("featureSchemaHash", 0)) != FEATURE_SCHEMA_HASH
+            or int(info.get("beliefSchemaHash", 0)) != BELIEF_SCHEMA_HASH):
         raise RuntimeError("V3 evaluator model was not accepted")
     _evaluator_loaded = True
 

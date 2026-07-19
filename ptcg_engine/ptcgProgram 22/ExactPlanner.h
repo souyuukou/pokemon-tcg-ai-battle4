@@ -27,6 +27,7 @@
 #include <unordered_set>
 #include <thread>
 #include <future>
+#include <fstream>
 #include <emmintrin.h>
 #ifdef _WIN32
 #include <windows.h>
@@ -34,6 +35,7 @@
 #pragma comment(lib, "psapi.lib")
 #else
 #include <sys/resource.h>
+#include <unistd.h>
 #endif
 
 // Registers ActivateSkillEffect / AfterEffect / … so Passive scans can treat the
@@ -70,6 +72,19 @@ inline void ExactEnsureDeferredFunctionRegistry() {
 	reg((void*)SelectedMain);
 }
 
+inline unsigned long long ExactPeakResidentBytes() {
+#ifdef _WIN32
+	PROCESS_MEMORY_COUNTERS_EX counters{};
+	if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&counters, sizeof(counters)))
+		return (unsigned long long)counters.PeakWorkingSetSize;
+	return 0;
+#else
+	struct rusage usage{};
+	if (getrusage(RUSAGE_SELF, &usage) != 0) return 0;
+	return (unsigned long long)usage.ru_maxrss * 1024ULL;
+#endif
+}
+
 inline unsigned long long ExactResidentBytes() {
 #ifdef _WIN32
 	PROCESS_MEMORY_COUNTERS_EX counters{};
@@ -77,9 +92,16 @@ inline unsigned long long ExactResidentBytes() {
 		return (unsigned long long)counters.WorkingSetSize;
 	return 0;
 #else
-	struct rusage usage{};
-	if (getrusage(RUSAGE_SELF, &usage) != 0) return 0;
-	return (unsigned long long)usage.ru_maxrss * 1024ULL;
+	// ru_maxrss is a process-lifetime peak and must never be used for the
+	// live memory guard.  /proc/self/statm reports the current resident page
+	// count, so a released TT/session can make the value fall again.
+	std::ifstream statm("/proc/self/statm");
+	unsigned long long sizePages = 0, residentPages = 0;
+	if (statm >> sizePages >> residentPages) {
+		const long pageSize = sysconf(_SC_PAGESIZE);
+		if (pageSize > 0) return residentPages * (unsigned long long)pageSize;
+	}
+	return 0;
 #endif
 }
 
@@ -687,6 +709,9 @@ struct ExactMetrics {
 	int lastDepthSelectType = 0;
 	int lastDepthTurnActionCount = 0;
 	int rootWorkers = 1;
+	unsigned long long rootQueueLeases = 0;
+	unsigned long long rootQueueReassignments = 0;
+	unsigned long long rootQueueSteals = 0;
 	int lastPendingPlayer = -1;
 	int lastPendingEffectCardId = 0;
 	int lastPendingEffectPlayer = -1;
@@ -714,6 +739,7 @@ struct ExactMetrics {
 	unsigned long long resumedActionCount = 0;
 	unsigned long long resumedChanceMass = 0;
 	int currentRootAction = -1;
+	unsigned long long currentRssBytes = 0;
 	unsigned long long peakRssBytes = 0;
 	bool memoryLimitReached = false;
 	bool structurallyBlocked = false;
@@ -750,6 +776,10 @@ struct ExactMetrics {
 	unsigned long long continuationDrawOutcomes = 0;
 	unsigned long long continuationCompletedOutcomeNodes = 0;
 	unsigned long long continuationMaxOutcomeNodes = 0;
+	unsigned long long streamingCursorHits = 0;
+	unsigned long long streamingCursorResumes = 0;
+	unsigned long long streamingCursorGenerated = 0;
+	unsigned long long streamingCursorPeakBytes = 0;
 	unsigned long long continuationAtomsMerged = 0;
 	unsigned long long v4SemanticEvaluations = 0;
 	unsigned long long v4PassiveEvaluations = 0;
@@ -1003,6 +1033,8 @@ public:
 		: deadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1, budgetMilliseconds))),
 		transposition(sharedTable ? sharedTable : std::make_shared<ExactSharedTransposition>()),
 		usingSharedTable(sharedTable != nullptr), evaluator(std::move(cpuEvaluator)) {
+		metrics.currentRssBytes = ExactResidentBytes();
+		metrics.peakRssBytes = ExactPeakResidentBytes();
 		actorDeckSnapshot.assign(deck, deck + deckCount);
 		if (handValues != nullptr)
 			actorHandValuesSnapshot.assign(handValues, handValues + deckCount);
@@ -1398,16 +1430,61 @@ private:
 		bool hasPassiveExpectation = false;
 		ExactBigRational expectedPassiveResidual{};
 	};
+	// Large multi-draws are generated in count-vector order.  The cursor owns
+	// only the bounded composition stack and one output, so interruption keeps
+	// its exact position without retaining every possible outcome.
+	struct MultiDrawCursor {
+		std::vector<std::pair<int, ExactWeight>> types;
+		BoundedCompositionCursor composition;
+		std::vector<int> counts;
+		int drawCount = 0;
+		bool initialized = false;
+
+		void reset(const std::vector<std::pair<int, ExactWeight>>& source, int take) {
+			types = source; drawCount = take; counts.clear();
+			std::vector<int> bounds; bounds.reserve(types.size());
+			for (const auto& item : types) {
+				if (!item.second.fitsUnsignedLongLong()
+					|| item.second.unsignedLongLong() > (unsigned long long)DECK_SIZE) {
+					initialized = false; return;
+				}
+				bounds.push_back((int)item.second.unsignedLongLong());
+			}
+			composition.reset(bounds, take); initialized = true;
+		}
+
+		bool next(MultiDrawOutcome& output) {
+			if (!initialized || !composition.next(counts)) return false;
+			output = {};
+			output.atomCounts = counts;
+			output.weight = ExactWeight(1);
+			output.continuationKey = "STREAM|";
+			for (size_t i = 0; i < counts.size(); ++i) {
+				output.weight = ExactWeight::multiply(output.weight,
+					chooseCount((int)types[i].second.unsignedLongLong(), counts[i]));
+				output.continuationKey += std::to_string(counts[i]);
+				output.continuationKey.push_back(',');
+			}
+			return true;
+		}
+
+		size_t bytes() const {
+			return sizeof(*this) + types.size() * sizeof(types[0])
+			+ composition.bounds.size() * sizeof(int) * 4 + counts.size() * sizeof(int);
+		}
+	};
 	struct PartialMultiDrawEntry {
 		std::vector<int> bounds;
 		std::string continuationSchema;
 		std::vector<MultiDrawOutcome> outcomes;
 		std::vector<unsigned char> outcomeDone;
+		MultiDrawCursor cursor;
+		MultiDrawOutcome pendingOutcome;
 		size_t outcomeIndex = 0;
 		ExactFraction completedLower = ExactFraction::integer(0);
 		ExactFraction completedUpper = ExactFraction::integer(0);
 		ExactWeight totalWeight, processedWeight, pendingWeight;
-		bool initialized = false, pending = false;
+		bool initialized = false, pending = false, streaming = false;
 		bool skeletonAttempted = false;
 		unsigned long long pendingExpandedNodes = 0;
 		size_t accountedBytes = 0;
@@ -1551,7 +1628,8 @@ private:
 		if (metrics.expanded >= nodeQuantumDeadline) return true;
 		if ((++resourceCheckCounter & 4095ULL) == 0) {
 			unsigned long long rss = ExactResidentBytes();
-			metrics.peakRssBytes = std::max(metrics.peakRssBytes, rss);
+			metrics.currentRssBytes = rss;
+			metrics.peakRssBytes = std::max(metrics.peakRssBytes, ExactPeakResidentBytes());
 			if (rss >= 2'700ULL * 1024ULL * 1024ULL) {
 				metrics.memoryLimitReached = true;
 				return true;
@@ -4818,10 +4896,124 @@ private:
 		return result;
 	}
 
+	ExactScore multiDrawChanceStreaming(const State& state, const std::string& nodeKey,
+		const std::vector<std::pair<int, ExactWeight>>& types) {
+		const int drawCount = state.exact.pendingCount;
+		int available = 0;
+		for (const auto& item : types) {
+			if (!item.second.fitsUnsignedLongLong()
+				|| item.second.unsignedLongLong() > (unsigned long long)DECK_SIZE) return unknown();
+			available += (int)item.second.unsignedLongLong();
+		}
+		if (drawCount <= 1 || drawCount > available) return unknown();
+		const std::string resumeKey = nodeKey + "\x1fMULTI-DRAW-STREAM";
+		auto [found, inserted] = partialMultiDraws.try_emplace(resumeKey);
+		PartialMultiDrawEntry& partial = found->second;
+		if (inserted || !partial.initialized) {
+			partial.bounds.clear();
+			for (const auto& item : types) partial.bounds.push_back((int)item.second.unsignedLongLong());
+			partial.continuationSchema = "STREAMING-COUNT-V1";
+			partial.totalWeight = chooseCount(available, drawCount);
+			partial.cursor.reset(types, drawCount);
+			if (!partial.cursor.initialized) { partialMultiDraws.erase(found); return unknown(); }
+			partial.streaming = true;
+			partial.initialized = true;
+			partial.accountedBytes = resumeKey.size() + sizeof(PartialMultiDrawEntry) + partial.cursor.bytes();
+			partialBytes += partial.accountedBytes;
+			metrics.streamingCursorHits++;
+			metrics.continuationDraws++;
+			metrics.continuationDrawClasses += types.size();
+		} else {
+			metrics.streamingCursorResumes++;
+			if (!partial.streaming || partial.bounds.size() != types.size()
+				|| partial.continuationSchema != "STREAMING-COUNT-V1"
+				|| partial.totalWeight != chooseCount(available, drawCount)) return unknown();
+		}
+		const ExactWeight& total = partial.totalWeight;
+		noteWeight(total);
+		partial.accountedBytes = resumeKey.size() + sizeof(PartialMultiDrawEntry) + partial.cursor.bytes()
+			+ partial.pendingOutcome.atomCounts.size() * sizeof(int)
+			+ partial.pendingOutcome.continuationKey.size();
+		metrics.streamingCursorPeakBytes = std::max<unsigned long long>(
+			metrics.streamingCursorPeakBytes, partial.accountedBytes);
+		auto incomplete = [&](const ExactScore* current = nullptr) {
+			ExactFraction lower = partial.completedLower, upper = partial.completedUpper;
+			ExactWeight covered = partial.processedWeight;
+			if (current != nullptr) {
+				lower = ExactFraction::add(lower, current->lower.scaled(partial.pendingWeight, total));
+				upper = ExactFraction::add(upper, current->upper.scaled(partial.pendingWeight, total));
+				covered += partial.pendingWeight;
+			}
+			ExactWeight remaining = covered >= total ? ExactWeight() : ExactWeight::subtract(total, covered);
+			lower = ExactFraction::add(lower, ExactFraction::integer(-100'000'000).scaled(remaining, total));
+			upper = ExactFraction::add(upper, ExactFraction::integer(100'000'000).scaled(remaining, total));
+			return ExactScore{ lower, upper, {}, false };
+		};
+		while (true) {
+			if (!partial.pending) {
+				if (!partial.cursor.next(partial.pendingOutcome)) {
+					if (partial.processedWeight != total) {
+						metrics.chanceMassMismatches++; metrics.probabilityExact = false;
+						partialMultiDraws.erase(found); return unknown();
+					}
+					ExactScore result{ partial.completedLower, partial.completedUpper, {},
+						ExactCompare(partial.completedLower, partial.completedUpper) == 0 };
+					partialBytes -= std::min(partialBytes, partial.accountedBytes);
+					partialMultiDraws.erase(found); return result;
+				}
+				partial.pendingWeight = partial.pendingOutcome.weight;
+				partial.pending = true;
+				metrics.streamingCursorGenerated++;
+				metrics.rawOutcomes++;
+				metrics.continuationPreparedOutcomes++;
+				partial.accountedBytes = resumeKey.size() + sizeof(PartialMultiDrawEntry) + partial.cursor.bytes()
+					+ partial.pendingOutcome.atomCounts.size() * sizeof(int)
+					+ partial.pendingOutcome.continuationKey.size();
+				metrics.streamingCursorPeakBytes = std::max<unsigned long long>(
+					metrics.streamingCursorPeakBytes, partial.accountedBytes);
+			}
+			if (expired()) { metrics.partialChanceNodes++; return incomplete(); }
+			ExactStatePtr child = cloneState(state);
+			try {
+				for (int i = 0; i < (int)partial.pendingOutcome.atomCounts.size(); ++i)
+					for (int n = 0; n < partial.pendingOutcome.atomCounts[i]; ++n)
+						resolveDraw(*child, types[i].first);
+			} catch (...) { return unknown(); }
+			ExactScore score = solveOwned(std::move(child));
+			if (!score.certified) { metrics.partialChanceNodes++; return incomplete(&score); }
+			partial.completedLower = ExactFraction::add(partial.completedLower,
+				score.lower.scaled(partial.pendingWeight, total));
+			partial.completedUpper = ExactFraction::add(partial.completedUpper,
+				score.upper.scaled(partial.pendingWeight, total));
+			if (!partial.completedLower.valid || !partial.completedUpper.valid) {
+				metrics.arithmeticOverflow = true; return unknown();
+			}
+			partial.processedWeight += partial.pendingWeight;
+			metrics.enumeratedHiddenWorlds++;
+			metrics.continuationDrawOutcomes++;
+			partial.pendingWeight = ExactWeight();
+			partial.pendingOutcome = {};
+			partial.pending = false;
+			if (partial.processedWeight == total) {
+				ExactScore result{ partial.completedLower, partial.completedUpper, {},
+					ExactCompare(partial.completedLower, partial.completedUpper) == 0 };
+				partialBytes -= std::min(partialBytes, partial.accountedBytes);
+				partialMultiDraws.erase(found); return result;
+			}
+		}
+	}
+
 	ExactScore multiDrawChance(const State& state, const std::string& nodeKey) {
 		auto types = chanceCardTypes(state);
 		const int drawCount = state.exact.pendingCount;
 		if (types.empty() || drawCount <= 1) return unknown();
+		// The count-vector upper bound is cheap and conservative.  Large spaces
+		// use the resumable cursor path before continuation classes can materialize
+		// a product of allocations.
+		ExactWeight compositionUpper = chooseCount((int)types.size() + drawCount - 1, drawCount);
+		if (!compositionUpper.fitsUnsignedLongLong()
+			|| compositionUpper.unsignedLongLong() > 1024ULL)
+			return multiDrawChanceStreaming(state, nodeKey, types);
 		std::string continuationSchema;
 		std::vector<DrawContinuationClass> classes;
 		if (state.exact.pendingPlayer == actor) {

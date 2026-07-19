@@ -116,6 +116,7 @@
     <ClInclude Include="EffectInstant.h" />
     <ClInclude Include="EffectProc.h" />
     <ClInclude Include="ExactSearchHooks.h" />
+    <ClInclude Include="ExactEvaluatorManifest.h" />
     <ClInclude Include="ExactCardPartition.h" />
     <ClInclude Include="ExactCardLivenessV4.h" />
     <ClInclude Include="ExactFeatureRecordV4.h" />

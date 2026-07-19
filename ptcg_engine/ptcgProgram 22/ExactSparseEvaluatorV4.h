@@ -15,6 +15,7 @@
 #include "ExactCardLivenessV4.h"
 #include "ExactPassivePayloadV4.h"
 #include "ExactSparseEvaluatorV3.h"
+#include "ExactEvaluatorManifest.h"
 
 // V4 = V3 Semantic Trunk + Passive Residual (context-free bias + sparse pairs in V4.0).
 class ExactSparseEvaluatorV4 {
@@ -32,6 +33,7 @@ public:
 	};
 
 	bool load(const std::string& path, std::string& error) {
+		loaded = false; manifestSafe = false; modelHashValue = 0;
 		std::ifstream in(path, std::ios::binary);
 		if (!in) { error = "unable to open V4 model"; return false; }
 		in.seekg(0, std::ios::end);
@@ -69,9 +71,11 @@ public:
 			in.read(reinterpret_cast<char*>(passivePairs.data()),
 				(std::streamsize)(header.pairCount * sizeof(ExactPassivePairWeightV4)));
 		if (!in) { error = "truncated V4 model"; return false; }
-		char trailing = 0;
-		in.read(&trailing, 1);
-		if (in.gcount() != 0) { error = "trailing bytes in V4 model"; return false; }
+		in.read(reinterpret_cast<char*>(&manifest), sizeof(manifest));
+		if (!in || !ExactEvaluatorManifestMatches(manifest, ModelSchemaVersion)) {
+			error = "V4 evaluator manifest mismatch"; return false;
+		}
+		manifestSafe = true;
 
 		const std::uint64_t payloadChecksum = computePayloadChecksum();
 		if (header.payloadChecksum != 0 && header.payloadChecksum != payloadChecksum) {
@@ -164,6 +168,8 @@ public:
 	}
 
 	bool isLoaded() const { return loaded; }
+	bool isStandalone() const { return standalone; }
+	bool manifestInformationSetSafe() const { return loaded && manifestSafe; }
 	bool hasV3Trunk() const { return v3Trunk != nullptr; }
 	int modelSchemaVersion() const { return ModelSchemaVersion; }
 	int featureSchemaVersion() const { return FeatureSchemaVersion; }
@@ -344,6 +350,8 @@ private:
 	bool enablePairs = true;
 	bool analyticIntegralAllowed = false;
 	std::uint64_t modelHashValue = 0;
+	ExactEvaluatorManifestDisk manifest{};
+	bool manifestSafe = false;
 	std::uint64_t requiredV3ModelHash = 0;
 	std::uint64_t featureSchemaHash = 0;
 	std::uint64_t livenessSchemaHash = 0;

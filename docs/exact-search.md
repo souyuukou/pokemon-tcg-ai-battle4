@@ -51,10 +51,18 @@ evaluator versions and the leaf definition.
 
 ## Resource policy
 
-Use at most two independent root workers. Each worker owns native states and its
-chance provider; immutable card data may be shared. The intended RSS hard stop is
-2.7 GB: approximately 1.3 GB keys/TT, 0.8 GB workers, 0.3 GB beliefs/policy/rational
-values, and 0.3 GB headroom. Keep 30 seconds of the 600-second match bank.
+Use at most two root workers. Root actions are leases in a shared priority
+queue. A lease is bounded to a short slice and returns the task to the queue;
+the task retains its own planner, interval, consumed-node count, and chance
+cursor, so another worker can continue it without regenerating completed
+outcomes. The queue priority combines the initial work estimate, remaining
+interval, consumed nodes, and deterministic tie-breakers.
+
+The intended RSS hard stop is 2.7 GB: approximately 1.3 GB keys/TT, 0.8 GB
+workers, 0.3 GB beliefs/policy/rational values, and 0.3 GB headroom. On Linux,
+admission reads current `/proc/self/statm` resident pages; `ru_maxrss` is used
+only for the diagnostic peak field. Keep 30 seconds of the 600-second match
+bank.
 
 An interrupted node is stored as an interval, never as an exact value. The
 emergency action maximizes the proven lower bound and is marked `certified=false`.
@@ -72,6 +80,9 @@ search metrics.
 
 The planner stores the actor's unknown deck and prizes as one card-count pool.
 Draws and prize takes branch by card type with remaining-copy integer weights.
+For large multi-card draws, a `MultiDrawCursor` yields one bounded count-vector
+outcome at a time and persists its composition stack across interruption;
+small continuation spaces may use the bounded legacy vector path.
 When an effect legally reveals the deck, prize multisets are enumerated lazily
 with hypergeometric weights and the triggering action is replayed in each
 resulting information state. A shuffled known deck is a multiset, not a sampled
@@ -152,8 +163,11 @@ policies; it is exposed as
 evaluator is a perfect estimate of eventual match outcome.
 
 `ExactLoadEvaluatorModel` and `ExactUnloadEvaluatorModel` expose explicit model
-lifetime control. Active turn sessions retain an immutable shared model after it
-is detached from future searches.
+lifetime control. Every model payload ends with a versioned manifest containing
+the feature-schema hash, belief-schema hash, `informationSetSafe`, and
+`boundaryOnly`. The native loader rejects a missing or mismatched manifest;
+active turn sessions retain an immutable shared model after it is detached from
+future searches.
 
 Windows x64 `cg.dll` and Linux x86-64 `libcg.so` include `ExactDecide`. The
 Python wrapper feature-detects the symbol so the unchanged ARM64 library uses a

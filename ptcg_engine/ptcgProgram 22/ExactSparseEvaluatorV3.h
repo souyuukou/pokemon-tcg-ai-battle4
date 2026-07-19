@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "ExactEvaluatorAvx2.h"
+#include "ExactEvaluatorManifest.h"
 
 // V3 keeps the rule-observable record structured.  In particular, attached
 // cards and effects live inside their Pokemon entity; they are never reduced
@@ -130,6 +131,7 @@ public:
 	};
 
 	bool load(const std::string& path, std::string& error) {
+		loaded = false; manifestSafe = false; modelHashValue = 0;
 		std::ifstream stream(path, std::ios::binary | std::ios::ate);
 		if (!stream) { error = "cannot open evaluator model"; return false; }
 		const std::streamoff length = stream.tellg();
@@ -163,7 +165,14 @@ public:
 			+ (size_t)PoolCount * EntityHiddenCount * GlobalHiddenCount * sizeof(std::int16_t)
 			+ (size_t)GlobalHiddenCount * sizeof(std::int32_t)
 			+ (size_t)GlobalHiddenCount * sizeof(std::int16_t) + sizeof(std::int64_t);
-		if (raw.size() != expected) { error = "invalid evaluator V3 payload length"; return false; }
+		const bool hasManifest = raw.size() == expected + sizeof(ExactEvaluatorManifestDisk);
+		if (raw.size() != expected && !hasManifest) { error = "invalid evaluator V3 payload length"; return false; }
+		if (!hasManifest) { error = "evaluator V3 manifest is missing"; return false; }
+		std::memcpy(&manifest, raw.data() + expected, sizeof(manifest));
+		if (!ExactEvaluatorManifestMatches(manifest, SchemaVersion)) {
+			error = "evaluator V3 manifest mismatch"; return false;
+		}
+		manifestSafe = true;
 		size_t offset = sizeof(Header);
 		auto read = [&](auto& destination, size_t count) {
 			using Value = typename std::decay_t<decltype(destination)>::value_type;
@@ -215,6 +224,7 @@ public:
 	}
 
 	bool isLoaded() const { return loaded; }
+	bool manifestInformationSetSafe() const { return loaded && manifestSafe; }
 	std::uint64_t modelHash() const { return modelHashValue; }
 	const std::string& path() const { return modelPath; }
 	size_t residentBytes() const {
@@ -725,6 +735,8 @@ private:
 	bool loaded = false;
 	bool avx2Enabled = false;
 	std::string modelPath;
+	ExactEvaluatorManifestDisk manifest{};
+	bool manifestSafe = false;
 
 	bool accumulatorBoundsSafe() const {
 		constexpr std::array<long long, EntityDenseCount> entityMax{

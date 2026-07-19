@@ -30,6 +30,18 @@ boundaries.
 - Resource limits: the planner uses two workers, a bounded state/key arena,
   exact rational weights, resumable per-turn sessions, and interval results
   when the 600-second/3 GB runtime budget is reached.
+- Linux admission uses `/proc/self/statm` current RSS; `ru_maxrss` is retained
+  only for the diagnostic peak field, so releasing a session permits later
+  turns to search again.
+- Root branches are leased from a shared priority queue in bounded slices.
+  Each task owns its planner and cursor, so a lease can move between workers
+  without regenerating completed chance outcomes.
+- Large multi-card draws use a `MultiDrawCursor` count-vector generator. Only
+  a bounded composition stack and the current outcome are retained; the legacy
+  continuation vector is reserved for small spaces where it is memory-bounded.
+- Evaluator payloads carry a versioned manifest with feature/belief schema
+  hashes, `informationSetSafe`, and `boundaryOnly`; load succeeds only after
+  exact code-side validation.
 - Tests: probability normalization, compressed-vs-physical draw equivalence,
   MDD sharing, observation-contingent policy, TT merging, boundary-only Value,
   interval interruption, partial-order safety, adapter compilation, the

@@ -7,6 +7,7 @@ from fractions import Fraction
 import os
 import time
 from typing import Callable, Sequence, Any
+from pathlib import Path
 
 from .solver import SearchResult
 
@@ -69,10 +70,35 @@ def current_rss_bytes() -> int:
         if psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
             return int(counters.WorkingSetSize)
         return 0
+    if os.name == "posix":
+        # ru_maxrss is a lifetime peak.  It is useful for diagnostics, but
+        # using it here would permanently stop later turns after one large
+        # search.  statm's resident field is the current resident page count.
+        try:
+            page_size = os.sysconf("SC_PAGESIZE")
+            fields = Path("/proc/self/statm").read_text(encoding="ascii").split()
+            if len(fields) >= 2 and page_size > 0:
+                return int(fields[1]) * int(page_size)
+        except (FileNotFoundError, OSError, ValueError, IndexError):
+            pass
     try:
         import resource
-        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return int(rss if sys_platform_is_macos() else rss * 1024)
+        # On systems without procfs we cannot obtain a falling live RSS.  Keep
+        # the peak API separate; returning zero makes the caller fail open
+        # rather than confuse a peak with the current value.
+        if sys_platform_is_macos():
+            return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (ImportError, OSError):
+        pass
+    return 0
+
+
+def peak_rss_bytes() -> int:
+    """Diagnostic process-lifetime peak RSS; never use this for admission."""
+    try:
+        import resource
+        value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        return value if sys_platform_is_macos() else value * 1024
     except (ImportError, OSError):
         return 0
 

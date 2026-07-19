@@ -18,6 +18,7 @@ CONTEXT_HIDDEN = 32
 PASSIVE_CONTEXT_SCALE = 4096
 # magic + 7x u32 + legacyChecksum u64 + 5x u64 + 2x i64 + reserved 16
 HEADER = struct.Struct("<8s7IQQQQQQQqq16s")
+MANIFEST = nnue_v3.MANIFEST
 
 
 @dataclass(frozen=True)
@@ -156,7 +157,7 @@ def export_quantized(path: str | Path, model: QuantizedModelV4) -> None:
     body = b"".join(payload)
     payload_checksum = model.payload_checksum or nnue_v3.fnv1a(body)
     header_size = HEADER.size
-    expected = header_size + len(body)
+    expected = header_size + len(body) + MANIFEST.size
     header = HEADER.pack(
         MAGIC,
         MODEL_SCHEMA,
@@ -177,7 +178,9 @@ def export_quantized(path: str | Path, model: QuantizedModelV4) -> None:
         int(model.proven_max_output),
         bytes(16),
     )
-    Path(path).write_bytes(header + body)
+    manifest = MANIFEST.pack(nnue_v3.MANIFEST_MAGIC, nnue_v3.MANIFEST_VERSION, MODEL_SCHEMA,
+                             nnue_v3.FEATURE_SCHEMA_HASH, nnue_v3.BELIEF_SCHEMA_HASH, 1, 1, bytes(6))
+    Path(path).write_bytes(header + body + manifest)
 
 
 def predict_integer_v4(
