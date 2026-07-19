@@ -1,0 +1,23 @@
+# Generated build and test output
+build/
+**/x64/
+**/Debug/
+**/Release/
+**/__pycache__/
+*.pyc
+
+# Replay datasets and generated caches
+data/kaggle_replays/
+*.pt
+
+# Local packaging output (the source files remain tracked)
+sample_submission/submission.zip
+sample_submission/submission_ready.zip
+
+# IDE and OS files
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
