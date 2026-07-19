@@ -300,14 +300,17 @@ def _turn_slice_milliseconds(ctx: PolicyContext, is_new_turn: bool, usable_ms: i
     selection_cap = int(os.environ.get("PTCG_EXACT_SELECTION_MS", "5000"))
     remaining_turn_ms = turn_cap - int(ctx.turn_search_seconds * 1000)
     if remaining_turn_ms <= 0:
-        # ExactTurnAdvance checks the retained observation-keyed policy before
-        # it resumes search.  Permit that cache lookup even after the expansion
-        # budget is spent; otherwise the expensive full-turn policy is thrown
-        # away after only its first action.
+        # A retained policy lookup is cheap, but the observed continuation may
+        # be an unfinished branch that was not reached during the root slice.
+        # Give that re-root one normal selection slice instead of 1 ms.  The
+        # process-wide MatchBudget remains the hard 600-second ceiling.
         if allow_reroot:
-            return 1
+            return max(1, min(selection_cap, usable_ms))
         raise RuntimeError("exact turn search budget reached")
-    return max(1, min(remaining_turn_ms, turn_cap if is_new_turn else selection_cap, usable_ms))
+    # Small slices make the native root queue resumable and let Python stop as
+    # soon as exact-value certification is reached instead of reserving the
+    # whole turn allowance for a single opaque call.
+    return max(1, min(remaining_turn_ms, selection_cap, usable_ms))
 
 
 def _turn_owner(current) -> int | None:
@@ -343,6 +346,11 @@ def choose_action(obs, *, context: PolicyContext | None = None,
     if not 0 <= select.minCount <= select.maxCount <= option_count:
         raise ValueError("invalid observation")
 
+    # Setup is not a turn-end-boundary search problem. Keep it out of the
+    # emergency path and name the deterministic deck-specific policy explicitly.
+    if obs.current is None or obs.current.turn <= 0:
+        return finish(_fallback_action(obs), False, "setup-policy")
+
     # Effects resolved during the opponent's turn can ask this process to choose
     # a promotion, discard, switch target, and similar options.  They are outside
     # the own-turn planning objective.  Starting a 90-second ExactTurnSession for
@@ -366,8 +374,6 @@ def choose_action(obs, *, context: PolicyContext | None = None,
     global _last_turn, last_decision
     native_failure = "native exact chance provider unavailable"
     try:
-        if obs.current is None or obs.current.turn <= 0:
-            raise RuntimeError("exact turn search starts after setup")
         if not ctx.budget.can_expand():
             raise RuntimeError("exact search resource reserve reached")
         from cg.api import exact_decide, exact_turn_begin, exact_turn_advance, exact_turn_release
@@ -399,6 +405,35 @@ def choose_action(obs, *, context: PolicyContext | None = None,
         else:
             native = exact_decide(obs, list(profile.cards), hand_values, requested_ms)
             reason = "native-exact-turn-search"
+
+        # Continue the same observable root until its exact value and argmax are
+        # certified, or until the explicit turn/match resource ceiling is
+        # reached. ExactTurnAdvance now retains every root task, so these calls
+        # monotonically refine all competing action intervals.
+        turn_cap_ms = int(os.environ.get("PTCG_EXACT_TURN_MS", "90000"))
+        selection_cap_ms = int(os.environ.get("PTCG_EXACT_SELECTION_MS", "5000"))
+        while (ctx.session_id is not None
+               and not bool(native.get("exactValueCertified", native.get("certified", False)))
+               and not bool(native.get("structurallyBlocked", False))
+               and not bool(native.get("memoryLimitReached", False))
+               and int(native.get("boundContradictions", 0)) == 0
+               and int(native.get("sessionInvalidations", 0)) == 0):
+            elapsed_ms = int((time.monotonic() - call_started) * 1000)
+            remaining_turn_ms = turn_cap_ms - int(ctx.turn_search_seconds * 1000) - elapsed_ms
+            remaining_match_ms = int(
+                (ctx.budget.remaining - ctx.budget.limits.reserve_seconds) * 1000
+            ) - elapsed_ms
+            remaining_ms = min(remaining_turn_ms, remaining_match_ms)
+            if remaining_ms <= 0:
+                break
+            native = exact_turn_advance(
+                ctx.session_id, obs,
+                max(1, min(selection_cap_ms, remaining_ms)),
+            )
+            reason = ("native-exact-certified"
+                      if native.get("exactValueCertified", native.get("certified", False))
+                      else "native-exact-resume")
+
         action = [int(index) for index in native["selected"]]
         if select.minCount <= len(action) <= select.maxCount and len(set(action)) == len(action) \
                 and all(0 <= index < option_count for index in action):
@@ -407,19 +442,19 @@ def choose_action(obs, *, context: PolicyContext | None = None,
             if context is None:
                 _last_turn = ctx.last_turn
                 last_decision = native
-            # A partial root interval can select whichever branch happened to
-            # receive the first useful lower bound.  It is safe as an interval,
-            # but it is not a proof that the action is best.  Keep the native
-            # session and metrics for the next re-root, while using the tactical
-            # policy until the argmax itself has been certified.
-            if bool(native.get("bestActionCertified", native.get("certified", False))):
-                return finish(action, bool(native["certified"]), reason)
-            native_failure = "native best action is not certified"
+            if not bool(native.get("exactValueCertified", native.get("certified", False))):
+                reason = "native-exact-budget-exhausted"
+            # At a hard resource ceiling, return the exact solver's documented
+            # highest-lower-bound action and interval. Never replace an
+            # information-set-safe native result with the emergency heuristic.
+            return finish(action, bool(native.get("exactValueCertified",
+                                                   native.get("certified", False))),
+                          reason)
     except Exception as error:
         native_failure = f"{type(error).__name__}: {error}"
     # O(n log n), including variable-cardinality selections.  Enumerating every
     # combination here used to make the emergency path itself exceed the clock
     # on large search lists.
     best = _fallback_action(obs)
-    return finish(best, False, f"emergency-policy: {native_failure}")
+    return finish(best, False, f"fail-closed-policy: {native_failure}")
 

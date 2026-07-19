@@ -122,14 +122,14 @@ class AgentPolicyFallbackTest(unittest.TestCase):
         obs = _observation(SelectContext.IS_FIRST, options)
         self.assertEqual([1], agent_policy._fallback_action(obs))
 
-    def test_spent_turn_budget_still_allows_policy_reroot_lookup(self) -> None:
+    def test_spent_turn_budget_reserves_a_reroot_selection_slice(self) -> None:
         context = agent_policy.PolicyContext()
         context.turn_search_seconds = 10.0
         old = os.environ.get("PTCG_EXACT_TURN_MS")
         os.environ["PTCG_EXACT_TURN_MS"] = "1"
         try:
             self.assertEqual(
-                1,
+                100,
                 agent_policy._turn_slice_milliseconds(
                     context, False, 100, allow_reroot=True
                 ),
@@ -144,7 +144,7 @@ class AgentPolicyFallbackTest(unittest.TestCase):
             else:
                 os.environ["PTCG_EXACT_TURN_MS"] = old
 
-    def test_unproven_native_root_action_uses_tactical_fallback(self) -> None:
+    def test_unproven_native_root_action_is_not_replaced_by_fallback(self) -> None:
         hand = [Card(741, 1, 0)]
         options = [
             Option(OptionType.END),
@@ -163,6 +163,7 @@ class AgentPolicyFallbackTest(unittest.TestCase):
             "selected": [0],
             "certified": False,
             "bestActionCertified": False,
+            "memoryLimitReached": True,
             "sessionId": 99,
         }
         try:
@@ -171,9 +172,9 @@ class AgentPolicyFallbackTest(unittest.TestCase):
                 action, certified, reason = agent_policy.choose_action(
                     obs, context=context
                 )
-            self.assertEqual([1], action)
+            self.assertEqual([0], action)
             self.assertFalse(certified)
-            self.assertIn("native best action is not certified", reason)
+            self.assertEqual("native-exact-budget-exhausted", reason)
         finally:
             # The native begin call was mocked, so there is no real session to
             # release from the global engine registry.

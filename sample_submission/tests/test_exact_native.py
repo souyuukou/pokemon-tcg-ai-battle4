@@ -3,11 +3,20 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from pathlib import Path
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "sample_submission"))
 sys.path.insert(0, ROOT)
 
-from cg.api import exact_decide, exact_turn_progress, to_observation_class
+from cg.api import (
+    exact_decide,
+    exact_load_evaluator_model,
+    exact_turn_advance,
+    exact_turn_begin,
+    exact_turn_progress,
+    exact_turn_release,
+    to_observation_class,
+)
 from cg.game import battle_finish, battle_select, battle_start_seeded
 from exact_solver.profile import load_profile
 from exact_solver import agent_policy
@@ -15,6 +24,49 @@ import main
 
 
 class NativeExactSmokeTest(unittest.TestCase):
+    def test_same_root_resume_retains_every_competing_action(self) -> None:
+        profile = load_profile()
+        deck = list(profile.cards)
+        exact_load_evaluator_model(str(
+            Path(ROOT, "exact-evaluator-v3.bin").resolve()
+        ))
+        raw, start = battle_start_seeded(deck, deck, 17)
+        self.assertEqual(-1, start.errorPlayer, start.errorType)
+        session_id = None
+        try:
+            target = None
+            for _ in range(96):
+                obs = to_observation_class(raw)
+                if (obs.current.turn > 0
+                        and agent_policy._turn_owner(obs.current) == obs.current.yourIndex
+                        and len(obs.select.option) > 1):
+                    target = obs
+                    break
+                raw = battle_select(list(range(obs.select.minCount)))
+            self.assertIsNotNone(target)
+
+            decision = exact_turn_begin(target, deck, [100] * 60, 1)
+            session_id = int(decision["sessionId"])
+            initial_leases = int(decision["rootQueueLeases"])
+            maximum_leases = initial_leases
+            for _ in range(10):
+                if decision["exactValueCertified"]:
+                    break
+                decision = exact_turn_advance(session_id, target, 50)
+                maximum_leases = max(
+                    maximum_leases, int(decision["rootQueueLeases"])
+                )
+                self.assertEqual(
+                    len(target.select.option), len(decision["rootActions"])
+                )
+            self.assertGreater(maximum_leases, initial_leases)
+            self.assertTrue(decision["bestActionCertified"])
+            self.assertTrue(decision["exactValueCertified"])
+        finally:
+            if session_id is not None:
+                exact_turn_release(session_id)
+            battle_finish()
+
     def test_battle3_profile_is_default_and_native_api_is_connected(self) -> None:
         profile = load_profile()
         self.assertEqual(60, len(profile.cards))
@@ -69,6 +121,19 @@ class NativeExactSmokeTest(unittest.TestCase):
                         tiny = exact_decide(obs_after, list(profile.cards),
                                             [100] * len(profile.cards), 1)
                         self.assertFalse(tiny["bestActionCertified"])
+                        self.assertGreaterEqual(
+                            len(tiny["selected"]), obs_after.select.minCount
+                        )
+                        self.assertLessEqual(
+                            len(tiny["selected"]), obs_after.select.maxCount
+                        )
+                        self.assertEqual(
+                            len(tiny["selected"]), len(set(tiny["selected"]))
+                        )
+                        self.assertTrue(all(
+                            0 <= int(index) < len(obs_after.select.option)
+                            for index in tiny["selected"]
+                        ))
                     break
                 if obs_after.current.turn > 0:
                     # Consume the other side's decision without inspecting its

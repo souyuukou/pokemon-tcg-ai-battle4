@@ -1239,6 +1239,31 @@ public:
 		root.exact.actor = (signed char)actor;
 		ExactDecision result;
 		result.score = solveOwned(cloneState(root));
+		// A deadline may expire while the root information key is still being
+		// initialized, before decision() has visited even one successor.  The
+		// exact interval remains the safe global range, but the public API must
+		// still return a legal action instead of forcing its caller into a
+		// separate emergency policy.  Prefer End at Main; otherwise use the
+		// first required physical options.  This action is deliberately left
+		// uncertified and carries no invented value information.
+		if (result.score.action.empty() && root.selectMin > 0
+			&& root.options.size() >= (size_t)root.selectMin) {
+			ExactSmallAction provisional;
+			if (root.selectType == SelectType::Main && root.selectMin == 1) {
+				for (int i = 0; i < (int)root.options.size(); ++i)
+					if (root.options[i].type == SelectOptionType::End) {
+						provisional.push_back(i);
+						break;
+					}
+			}
+			for (int i = 0; provisional.size() < (size_t)root.selectMin; ++i)
+				provisional.push_back(i);
+			provisional.sort();
+			result.score = unknown();
+			result.score.action = provisional;
+			rootActionValues.push_back({ provisional, result.score.lower,
+				result.score.upper, false });
+		}
 		result.rootActions = rootActionValues;
 		const bool certifiable = ExactMetricsCanCertify(metrics);
 		result.bestActionCertified = certifiable && result.score.boundsSound
@@ -1402,6 +1427,9 @@ public:
 	const ExactMetrics& currentMetrics() const { return metrics; }
 	bool resourceStopped() const { return metrics.memoryLimitReached; }
 	void noteBoundContradiction() { ++metrics.boundContradictions; }
+	std::string publicObservationKey(const State& observed) {
+		return observationKeyFor(observed);
+	}
 
 private:
 	struct ExactKnowledgeState {

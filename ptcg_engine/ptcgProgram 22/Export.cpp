@@ -1074,6 +1074,27 @@ struct ExactTurnSession {
     unsigned long long eliminations = 0;
     unsigned long long boundContradictions = 0;
 
+    bool exactDecisionReadyLocked() const {
+      int best = -1;
+      for (int i = 0; i < (int)tasks.size(); ++i) {
+        const RootTask& task = *tasks[i];
+        if (task.eliminated) continue;
+        if (task.blocked || !task.hasBeenVisited || !task.score.boundsSound)
+          return false;
+        if (best < 0 || ExactCompare(task.score.lower, tasks[best]->score.lower) > 0
+            || (ExactCompare(task.score.lower, tasks[best]->score.lower) == 0
+              && task.option < tasks[best]->option))
+          best = i;
+      }
+      if (best < 0 || !tasks[best]->score.certified) return false;
+      for (int i = 0; i < (int)tasks.size(); ++i) {
+        if (i == best || tasks[i]->eliminated) continue;
+        if (ExactCompare(tasks[i]->score.upper, tasks[best]->score.lower) > 0)
+          return false;
+      }
+      return true;
+    }
+
     static long double fractionApprox(const ExactFraction& value) {
       if (!value.valid) return 0.0L;
       if (value.big) return 100'000'000.0L;
@@ -1088,6 +1109,7 @@ struct ExactTurnSession {
 
     int acquire(int workerId) {
       std::lock_guard<std::mutex> lock(mutex);
+      if (exactDecisionReadyLocked()) return -1;
       int selected = -1;
       long double selectedPriority = -1.0L;
       for (int i = 0; i < (int)tasks.size(); ++i) {
@@ -1163,6 +1185,7 @@ struct ExactTurnSession {
 
     bool pending() const {
       std::lock_guard<std::mutex> lock(mutex);
+      if (exactDecisionReadyLocked()) return false;
       for (const auto& item : tasks) {
         if (item->claimed) return true;
         if (!item->blocked && !item->eliminated
@@ -1175,11 +1198,174 @@ struct ExactTurnSession {
   std::unique_ptr<Game> game;
   std::unique_ptr<ExactPlanner> planner;
 	std::unique_ptr<Worker> alternateWorker;
+  std::unique_ptr<RootTaskQueue> rootQueue;
+  std::vector<int> rootRepresentative;
+  std::vector<int> rootOrderedOptions;
+  std::string rootObservationKey;
   ExactMetrics discardedMetrics;
   int turn = -1;
   int actor = -1;
 	ExactDecision lastDecision;
 	std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+
+  ExactDecision continueSharedRoot(const State& source, int budgetMilliseconds) {
+    ExactDecision decision;
+    if (!rootQueue || rootQueue->tasks.empty()) {
+      decision.metrics.sessionInvalidations++;
+      return decision;
+    }
+    RootTaskQueue& queue = *rootQueue;
+    const auto absoluteDeadline = std::chrono::steady_clock::now()
+      + std::chrono::milliseconds(std::max(1, budgetMilliseconds));
+
+    auto rootLease0 = ExactGlobalThreadBudget().acquire();
+    ExactThreadBudget::Lease rootLease1;
+    if (queue.tasks.size() > 1) rootLease1 = ExactGlobalThreadBudget().tryLease();
+    const bool rootParallel = static_cast<bool>(rootLease1);
+    for (const auto& task : queue.tasks) {
+      task->planner->setThreadPermitHeld(true);
+      task->planner->setChanceParallelEnabled(!rootParallel);
+    }
+
+    auto runWorker = [&](int workerId) {
+      while (std::chrono::steady_clock::now() < absoluteDeadline) {
+        const int index = queue.acquire(workerId);
+        if (index < 0) {
+          if (!queue.pending()) break;
+          std::this_thread::yield();
+          continue;
+        }
+        RootTask& task = *queue.tasks[index];
+        const unsigned long long expandedBefore = task.planner->currentMetrics().expanded;
+        const unsigned long long unknownBefore = task.planner->currentMetrics().unknownOpponentList;
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+          absoluteDeadline - std::chrono::steady_clock::now()).count();
+        const int slice = (int)std::max<long long>(1, std::min<long long>(remaining, 500));
+        task.planner->setBudgetMilliseconds(slice);
+        State local = source; local.game = task.game.get();
+        ExactScore fresh = task.planner->evaluateRootAction(local, task.option).score;
+        fresh.action = { task.option };
+        const unsigned long long expandedAfter = task.planner->currentMetrics().expanded;
+        const unsigned long long consumed =
+          expandedAfter >= expandedBefore ? expandedAfter - expandedBefore : 0;
+        const bool blocked = task.planner->currentMetrics().unknownOpponentList > unknownBefore;
+        queue.finishSlice(index, fresh, consumed,
+          blocked || task.planner->resourceStopped());
+      }
+    };
+
+    auto future0 = std::async(std::launch::async, runWorker, 0);
+    std::future<void> future1;
+    if (rootParallel) future1 = std::async(std::launch::async, runWorker, 1);
+    future0.get();
+    if (future1.valid()) future1.get();
+    for (const auto& task : queue.tasks)
+      task->planner->setThreadPermitHeld(false);
+    for (const auto& task : queue.tasks)
+      MergeExactMetrics(decision.metrics, task->planner->currentMetrics());
+    decision.metrics.boundContradictions += queue.boundContradictions;
+
+    int selectedIndex = -1;
+    bool first = true;
+    bool allRootTasksVisited = true;
+    ExactFraction maxUpper = ExactFraction::integer(-100'000'000);
+    for (int option : rootOrderedOptions) {
+      int index = -1;
+      for (int i = 0; i < (int)queue.tasks.size(); ++i)
+        if (queue.tasks[i]->option == option) { index = i; break; }
+      if (index < 0) {
+        allRootTasksVisited = false;
+        continue;
+      }
+      RootTask& task = *queue.tasks[index];
+      ExactScore item = task.score; item.action = { option };
+      decision.rootActions.push_back({ item.action, item.lower, item.upper, item.certified });
+      if (!task.hasBeenVisited) allRootTasksVisited = false;
+      if (task.eliminated) continue;
+      if (first || ExactCompare(item.lower, decision.score.lower) > 0
+          || (ExactCompare(item.lower, decision.score.lower) == 0
+            && item.action < decision.score.action)) {
+        selectedIndex = index;
+        decision.score = item;
+        first = false;
+      }
+      if (ExactCompare(item.upper, maxUpper) > 0) maxUpper = item.upper;
+    }
+    for (int option = 0; option < (int)rootRepresentative.size(); ++option) {
+      if (rootRepresentative[option] == option) continue;
+      int repIndex = -1;
+      for (int i = 0; i < (int)queue.tasks.size(); ++i)
+        if (queue.tasks[i]->option == rootRepresentative[option]) { repIndex = i; break; }
+      if (repIndex < 0) {
+        allRootTasksVisited = false;
+        continue;
+      }
+      ExactScore alias = queue.tasks[repIndex]->score; alias.action = { option };
+      decision.rootActions.push_back({ alias.action, alias.lower, alias.upper, alias.certified });
+      decision.metrics.successorMerges++;
+      decision.metrics.largestEquivalenceClass =
+        std::max<unsigned long long>(decision.metrics.largestEquivalenceClass, 2);
+    }
+
+    if (!first) {
+      ExactFraction maxOtherUpper;
+      bool hasOtherUpper = false;
+      bool allOtherBoundsSound = true;
+      for (const auto& task : queue.tasks) {
+        if (task->eliminated || task->option == queue.tasks[selectedIndex]->option)
+          continue;
+        if (!task->hasBeenVisited) allRootTasksVisited = false;
+        if (!task->score.boundsSound) allOtherBoundsSound = false;
+        if (!hasOtherUpper || ExactCompare(task->score.upper, maxOtherUpper) > 0) {
+          maxOtherUpper = task->score.upper;
+          hasOtherUpper = true;
+        }
+      }
+      decision.bestActionCertified = decision.metrics.informationSetSafe
+        && ExactMetricsCanCertify(decision.metrics)
+        && allRootTasksVisited
+        && queue.tasks[selectedIndex]->hasBeenVisited
+        && queue.tasks[selectedIndex]->score.boundsSound
+        && allOtherBoundsSound
+        && (!hasOtherUpper
+          || ExactCompare(decision.score.lower, maxOtherUpper) >= 0);
+      decision.actionValueCertified = decision.metrics.informationSetSafe
+        && ExactMetricsCanCertify(decision.metrics)
+        && queue.tasks[selectedIndex]->score.boundsSound
+        && queue.tasks[selectedIndex]->score.certified;
+      decision.exactValueCertified =
+        decision.bestActionCertified && decision.actionValueCertified;
+      if (!decision.bestActionCertified) decision.score.upper = maxUpper;
+      decision.score.boundsSound = decision.score.boundsSound && allOtherBoundsSound;
+      decision.score.certified = decision.exactValueCertified;
+    }
+    decision.metrics.rootWorkers = rootParallel ? 2 : 1;
+    decision.metrics.rootQueueLeases += queue.leases;
+    decision.metrics.rootQueueReassignments += queue.reassignments;
+    decision.metrics.rootQueueSteals += queue.steals;
+    decision.metrics.rootQueueEliminations += queue.eliminations;
+
+    if (decision.exactValueCertified && selectedIndex >= 0) {
+      discardedMetrics = {};
+      for (int i = 0; i < (int)queue.tasks.size(); ++i)
+        if (i != selectedIndex)
+          MergeExactMetrics(discardedMetrics,
+            queue.tasks[i]->planner->currentMetrics());
+      discardedMetrics.rootQueueLeases += queue.leases;
+      discardedMetrics.rootQueueReassignments += queue.reassignments;
+      discardedMetrics.rootQueueSteals += queue.steals;
+      discardedMetrics.rootQueueEliminations += queue.eliminations;
+      discardedMetrics.boundContradictions += queue.boundContradictions;
+      game = std::move(queue.tasks[selectedIndex]->game);
+      planner = std::move(queue.tasks[selectedIndex]->planner);
+      rootQueue.reset();
+      rootRepresentative.clear();
+      rootOrderedOptions.clear();
+      rootObservationKey.clear();
+    }
+    lastDecision = decision;
+    return decision;
+  }
 
   ExactDecision beginFixed(const State& source, const int* deck, const int* handValues, int deckCount,
       const int* opponentDeck, int opponentDeckCount, int budgetMilliseconds,
@@ -1483,7 +1669,10 @@ struct ExactTurnSession {
       if (representative[option] == option && source.options[option].type != SelectOptionType::End)
         orderedOptions.push_back(option);
 
-    RootTaskQueue queue;
+    rootQueue = std::make_unique<RootTaskQueue>();
+    RootTaskQueue& queue = *rootQueue;
+    rootRepresentative = representative;
+    rootOrderedOptions = orderedOptions;
     for (int option : orderedOptions) {
       auto task = std::make_unique<RootTask>();
       task->option = option; task->estimate = estimates[option];
@@ -1494,6 +1683,8 @@ struct ExactTurnSession {
       task->planner->setConcreteWorldCaching(true);
       queue.tasks.push_back(std::move(task));
     }
+    if (!queue.tasks.empty())
+      rootObservationKey = queue.tasks.front()->planner->publicObservationKey(source);
 	// Reserve one root permit, then opportunistically claim the second.  Holding
 	// the first permit while blocking for a second would deadlock two concurrent
 	// sessions, each of which already owns one permit.
@@ -1541,22 +1732,26 @@ struct ExactTurnSession {
 		MergeExactMetrics(decision.metrics, task->planner->currentMetrics());
 	decision.metrics.boundContradictions += queue.boundContradictions;
 
-    int selectedIndex = -1, alternateIndex = -1;
+    int selectedIndex = -1;
     bool first = true;
+    bool allRootTasksVisited = true;
     ExactFraction maxUpper = ExactFraction::integer(-100'000'000);
     for (int option : orderedOptions) {
       int index = -1;
       for (int i = 0; i < (int)queue.tasks.size(); ++i)
         if (queue.tasks[i]->option == option) { index = i; break; }
-      if (index < 0) continue;
+      if (index < 0) {
+        allRootTasksVisited = false;
+        continue;
+      }
       ExactScore item = queue.tasks[index]->score; item.action = { option };
       decision.rootActions.push_back({ item.action, item.lower, item.upper, item.certified });
+      if (!queue.tasks[index]->hasBeenVisited) allRootTasksVisited = false;
       if (queue.tasks[index]->eliminated) continue;
       if (first || ExactCompare(item.lower, decision.score.lower) > 0
           || (ExactCompare(item.lower, decision.score.lower) == 0 && item.action < decision.score.action)) {
-        if (selectedIndex >= 0) alternateIndex = selectedIndex;
         selectedIndex = index; decision.score = item; first = false;
-      } else if (alternateIndex < 0) alternateIndex = index;
+      }
       maxUpper = ExactCompare(item.upper, maxUpper) > 0 ? item.upper : maxUpper;
     }
     for (int option = 0; option < (int)representative.size(); ++option) {
@@ -1564,7 +1759,10 @@ struct ExactTurnSession {
       int repIndex = -1;
       for (int i = 0; i < (int)queue.tasks.size(); ++i)
         if (queue.tasks[i]->option == representative[option]) { repIndex = i; break; }
-      if (repIndex < 0) continue;
+      if (repIndex < 0) {
+        allRootTasksVisited = false;
+        continue;
+      }
       ExactScore alias = queue.tasks[repIndex]->score; alias.action = { option };
       decision.rootActions.push_back({ alias.action, alias.lower, alias.upper, alias.certified });
       decision.metrics.successorMerges++;
@@ -1577,6 +1775,7 @@ struct ExactTurnSession {
       for (const auto& task : queue.tasks) {
         if (task->eliminated || task->option == queue.tasks[selectedIndex]->option)
           continue;
+        if (!task->hasBeenVisited) allRootTasksVisited = false;
 		if (!task->score.boundsSound) allOtherBoundsSound = false;
         if (!hasOtherUpper || ExactCompare(task->score.upper, maxOtherUpper) > 0) {
           maxOtherUpper = task->score.upper;
@@ -1585,6 +1784,7 @@ struct ExactTurnSession {
       }
       decision.bestActionCertified = decision.metrics.informationSetSafe
 		&& ExactMetricsCanCertify(decision.metrics)
+        && allRootTasksVisited
         && queue.tasks[selectedIndex]->hasBeenVisited
 		&& queue.tasks[selectedIndex]->score.boundsSound
 		&& allOtherBoundsSound
@@ -1605,14 +1805,23 @@ struct ExactTurnSession {
     decision.metrics.rootQueueReassignments += queue.reassignments;
     decision.metrics.rootQueueSteals += queue.steals;
     decision.metrics.rootQueueEliminations += queue.eliminations;
-    if (selectedIndex >= 0) {
+    if (decision.exactValueCertified && selectedIndex >= 0) {
+      discardedMetrics = {};
+      for (int i = 0; i < (int)queue.tasks.size(); ++i)
+        if (i != selectedIndex)
+          MergeExactMetrics(discardedMetrics,
+            queue.tasks[i]->planner->currentMetrics());
+      discardedMetrics.rootQueueLeases += queue.leases;
+      discardedMetrics.rootQueueReassignments += queue.reassignments;
+      discardedMetrics.rootQueueSteals += queue.steals;
+      discardedMetrics.rootQueueEliminations += queue.eliminations;
+      discardedMetrics.boundContradictions += queue.boundContradictions;
       game = std::move(queue.tasks[selectedIndex]->game);
       planner = std::move(queue.tasks[selectedIndex]->planner);
-      if (alternateIndex >= 0 && alternateIndex != selectedIndex) {
-        alternateWorker = std::make_unique<Worker>();
-        alternateWorker->game = std::move(*queue.tasks[alternateIndex]->game);
-        alternateWorker->planner = std::move(queue.tasks[alternateIndex]->planner);
-      }
+      rootQueue.reset();
+      rootRepresentative.clear();
+      rootOrderedOptions.clear();
+      rootObservationKey.clear();
     }
     lastDecision = decision;
     return decision;
@@ -1620,7 +1829,58 @@ struct ExactTurnSession {
 
   ExactDecision advance(const State& source, int budgetMilliseconds) {
     ExactDecision decision;
-    if (source.turn != turn || source.selectPlayer != actor || planner == nullptr) {
+    if (source.turn != turn || source.selectPlayer != actor) {
+      decision.metrics = discardedMetrics;
+      decision.metrics.sessionInvalidations++;
+      return decision;
+    }
+    if (rootQueue != nullptr) {
+      if (rootQueue->tasks.empty()) {
+        decision.metrics = lastDecision.metrics;
+        decision.metrics.sessionInvalidations++;
+        return decision;
+      }
+      if (rootQueue->tasks.front()->planner->publicObservationKey(source)
+          == rootObservationKey)
+        return continueSharedRoot(source, budgetMilliseconds);
+
+      // The caller has applied the selected root action and is now asking for
+      // the next decision in the same turn.  Competing root tasks were needed
+      // only while the original observation was still actionable.  Commit the
+      // chosen task now, retaining its TT, policy entries, and partial chance
+      // cursors for re-rooting instead of invalidating the whole session.
+      int selectedOption = lastDecision.score.action.empty()
+        ? -1 : lastDecision.score.action.front();
+      int selectedIndex = -1;
+      for (int i = 0; i < (int)rootQueue->tasks.size(); ++i)
+        if (rootQueue->tasks[i]->option == selectedOption) {
+          selectedIndex = i;
+          break;
+        }
+      if (selectedIndex < 0) {
+        decision.metrics = lastDecision.metrics;
+        decision.metrics.sessionInvalidations++;
+        return decision;
+      }
+      discardedMetrics = {};
+      for (int i = 0; i < (int)rootQueue->tasks.size(); ++i)
+        if (i != selectedIndex)
+          MergeExactMetrics(discardedMetrics,
+            rootQueue->tasks[i]->planner->currentMetrics());
+      discardedMetrics.rootQueueLeases += rootQueue->leases;
+      discardedMetrics.rootQueueReassignments += rootQueue->reassignments;
+      discardedMetrics.rootQueueSteals += rootQueue->steals;
+      discardedMetrics.rootQueueEliminations += rootQueue->eliminations;
+      discardedMetrics.boundContradictions += rootQueue->boundContradictions;
+      game = std::move(rootQueue->tasks[selectedIndex]->game);
+      planner = std::move(rootQueue->tasks[selectedIndex]->planner);
+      planner->setChanceParallelEnabled(true);
+      rootQueue.reset();
+      rootRepresentative.clear();
+      rootOrderedOptions.clear();
+      rootObservationKey.clear();
+    }
+    if (planner == nullptr) {
       decision.metrics = discardedMetrics;
       decision.metrics.sessionInvalidations++;
       return decision;
