@@ -23,6 +23,12 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_SOURCE_DIR}/../ptcg_engine/ptcgProgram 22")
   add_test(NAME ptcg_adapter_compile_test COMMAND ptcg_adapter_compile_test)
 
+  add_executable(ptcg_exact_bound_merge_test tests/exact_bound_merge_test.cpp)
+  target_link_libraries(ptcg_exact_bound_merge_test PRIVATE boundary_ai)
+  target_include_directories(ptcg_exact_bound_merge_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../ptcg_engine/ptcgProgram 22")
+  add_test(NAME ptcg_exact_bound_merge_test COMMAND ptcg_exact_bound_merge_test)
+
   add_executable(boundary_ai_benchmark tests/benchmark.cpp)
   target_link_libraries(boundary_ai_benchmark PRIVATE boundary_ai)
 endif()

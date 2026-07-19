@@ -597,10 +597,12 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
   j.appendCommaKey("upperDenominator"); AppendExactDenominator(j, decision.score.upper);
   j.appendCommaKeyValue("certified", decision.score.certified);
   j.appendCommaKeyValue("boundsSound", decision.score.boundsSound);
+  j.appendCommaKeyValue("certificationBlocked", decision.score.certificationBlocked);
   j.appendCommaKeyValue("actionValueCertified", decision.actionValueCertified);
   j.appendCommaKeyValue("bestActionCertified", decision.bestActionCertified);
   j.appendCommaKeyValue("exactValueCertified", decision.exactValueCertified);
   j.appendCommaKeyValue("resumable", !decision.metrics.structurallyBlocked
+    && decision.metrics.boundContradictions == 0
     && !decision.bestActionCertified && !decision.exactValueCertified);
   j.appendCommaKey("certificationScope");
   j.appendDoubleQuote(ExactSkeleton::CertScopeName(decision.metrics.certificationScope));
@@ -692,6 +694,7 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
   j.appendCommaKey("rootQueueReassignments"); AppendUnsignedLongLong(j, decision.metrics.rootQueueReassignments);
   j.appendCommaKey("rootQueueSteals"); AppendUnsignedLongLong(j, decision.metrics.rootQueueSteals);
   j.appendCommaKey("rootQueueEliminations"); AppendUnsignedLongLong(j, decision.metrics.rootQueueEliminations);
+  j.appendCommaKey("boundContradictions"); AppendUnsignedLongLong(j, decision.metrics.boundContradictions);
   j.appendCommaKey("policyNodes"); AppendUnsignedLongLong(j, decision.metrics.policyNodes);
   j.appendCommaKey("policyHits"); AppendUnsignedLongLong(j, decision.metrics.policyHits);
   j.appendCommaKey("policyMisses"); AppendUnsignedLongLong(j, decision.metrics.policyMisses);
@@ -944,6 +947,7 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.attackPreviewUnavailableCount += from.attackPreviewUnavailableCount;
 	into.entityFeatureCount += from.entityFeatureCount; into.comboFeatureCount += from.comboFeatureCount;
 	into.provisionalOpponentPolicyNodes += from.provisionalOpponentPolicyNodes;
+	into.boundContradictions += from.boundContradictions;
 	into.dynamicPartitionBuilds += from.dynamicPartitionBuilds;
 	into.dynamicPartitionFallbacks += from.dynamicPartitionFallbacks;
 	into.dynamicPartitionCacheHits += from.dynamicPartitionCacheHits;
@@ -1040,6 +1044,7 @@ struct ExactTurnSession {
     std::vector<ExactScore> actions;
     std::vector<bool> visited;
     bool argmaxCut = false;
+    unsigned long long boundContradictions = 0;
   };
 
   struct RootTask {
@@ -1067,6 +1072,7 @@ struct ExactTurnSession {
     unsigned long long reassignments = 0;
     unsigned long long steals = 0;
     unsigned long long eliminations = 0;
+    unsigned long long boundContradictions = 0;
 
     static long double fractionApprox(const ExactFraction& value) {
       if (!value.valid) return 0.0L;
@@ -1116,14 +1122,22 @@ struct ExactTurnSession {
       if (index < 0 || index >= (int)tasks.size()) return;
       RootTask& task = *tasks[index];
       if (!task.hasBeenVisited) task.score = fresh;
-      else task.score = mergeSoundBounds(task.score, fresh);
+      else {
+        BoundMergeResult merged = mergeSoundBounds(task.score, fresh);
+        if (merged.contradiction) ++boundContradictions;
+        task.score = merged.score;
+      }
       task.score.action = { task.option };
       task.intervalWidth = remainingWidth(task.score);
       task.consumedNodes += consumedNodes;
       task.score.action = { task.option };
       task.hasBeenVisited = true;
       task.claimed = false;
-      task.blocked = task.blocked || blocked;
+      // A contradictory intersection is an invariant failure, not an
+      // ordinary unfinished slice.  Stop retrying the task and fail closed
+      // through the boundContradictions metric.
+      task.blocked = task.blocked || blocked ||
+        (!task.score.boundsSound && task.score.certificationBlocked);
       pruneDominatedLocked();
     }
 
@@ -1271,7 +1285,14 @@ struct ExactTurnSession {
 						saved = fresh;
 						output->visited[option] = true;
 					}
-					else saved = mergeSoundBounds(saved, fresh);
+					else {
+						BoundMergeResult merged = mergeSoundBounds(saved, fresh);
+						if (merged.contradiction) {
+							++output->boundContradictions;
+							structurallyBlocked[option] = true;
+						}
+						saved = merged.score;
+					}
 					saved.action = { option };
 					attempted = true;
 					if (output->planner->resourceStopped()) { resourceStopped = true; break; }
@@ -1338,12 +1359,15 @@ struct ExactTurnSession {
 				// sharing mutable partial cursors between workers.
 				bool preferItem = item.boundsSound
 					&& (!found->second.boundsSound || (item.certified && !found->second.certified));
-				found->second = mergeSoundBounds(found->second, item);
+				BoundMergeResult merged = mergeSoundBounds(found->second, item);
+				if (merged.contradiction) ++decision.metrics.boundContradictions;
+				found->second = merged.score;
 				found->second.action = { option };
 				if (preferItem) representativeWorker[option] = wi;
 		  }
         }
         MergeExactMetrics(decision.metrics, workers[wi]->planner->currentMetrics());
+        decision.metrics.boundContradictions += workers[wi]->boundContradictions;
         if (workers[wi]->argmaxCut) decision.metrics.argmaxDominatedCuts++;
       }
 	  bool first = true;
@@ -1515,6 +1539,7 @@ struct ExactTurnSession {
 		if (task->planner) task->planner->setThreadPermitHeld(false);
 	for (const auto& task : queue.tasks)
 		MergeExactMetrics(decision.metrics, task->planner->currentMetrics());
+	decision.metrics.boundContradictions += queue.boundContradictions;
 
     int selectedIndex = -1, alternateIndex = -1;
     bool first = true;
@@ -1648,10 +1673,11 @@ static const char8_t* ExactProgressJson(ApiData* data, long long sessionId, cons
 	 j.appendCommaKeyValue("bestActionCertified", session.lastDecision.bestActionCertified);
 	 j.appendCommaKeyValue("exactValueCertified", session.lastDecision.exactValueCertified);
 	 j.appendCommaKeyValue("resumable", !metrics.structurallyBlocked
+		&& metrics.boundContradictions == 0
 		&& !session.lastDecision.bestActionCertified
 		&& !session.lastDecision.exactValueCertified);
 	 j.appendCommaKey("searchStatus");
-	 j.appendDoubleQuote(metrics.structurallyBlocked ? u8"blocked"
+	 j.appendDoubleQuote((metrics.structurallyBlocked || metrics.boundContradictions > 0) ? u8"blocked"
 		 : (session.lastDecision.exactValueCertified ? u8"certified"
 		 : (session.lastDecision.bestActionCertified ? u8"best_action_certified" : u8"resumable")));
   j.appendCommaKey("elapsedMilliseconds"); AppendLongLong(j, session.elapsedMilliseconds());
@@ -1661,6 +1687,7 @@ static const char8_t* ExactProgressJson(ApiData* data, long long sessionId, cons
   j.appendCommaKey("beliefNodes"); AppendUnsignedLongLong(j, metrics.beliefNodes);
   j.appendCommaKey("informationSets"); AppendUnsignedLongLong(j, metrics.informationSets);
 	j.appendCommaKey("provisionalOpponentPolicyNodes"); AppendUnsignedLongLong(j, metrics.provisionalOpponentPolicyNodes);
+	j.appendCommaKey("boundContradictions"); AppendUnsignedLongLong(j, metrics.boundContradictions);
   j.appendCommaKey("bigWeightPromotions"); AppendUnsignedLongLong(j, metrics.bigWeightPromotions);
   j.appendCommaKeyValue("maxWeightBits", (int)metrics.maxWeightBits);
   j.append('}');
@@ -1876,7 +1903,12 @@ extern "C" {
         ExactDecision fresh = planner.evaluateRootAction(data->state, optionIndex);
         if (first) { accumulated = fresh; first = false; }
 		else {
-          accumulated.score = mergeSoundBounds(accumulated.score, fresh.score);
+          BoundMergeResult merged = mergeSoundBounds(accumulated.score, fresh.score);
+          if (merged.contradiction) {
+            planner.noteBoundContradiction();
+            break;
+          }
+          accumulated.score = merged.score;
           accumulated.score.action = { optionIndex };
           accumulated.rootActions = fresh.rootActions;
           accumulated.metrics = fresh.metrics;
@@ -1884,6 +1916,7 @@ extern "C" {
         if (accumulated.score.certified || planner.resourceStopped()) break;
       }
       if (first) accumulated = planner.evaluateRootAction(data->state, optionIndex);
+      accumulated.metrics = planner.currentMetrics();
       accumulated.bestActionCertified = false;
       accumulated.actionValueCertified = ExactMetricsCanCertify(accumulated.metrics)
         && accumulated.score.boundsSound && accumulated.score.certified;

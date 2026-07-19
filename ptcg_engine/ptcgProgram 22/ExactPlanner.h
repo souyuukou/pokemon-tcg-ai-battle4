@@ -533,26 +533,52 @@ struct ExactScore {
 	// provisional opponent policy must never produce a point interval here;
 	// it is widened to the global range before it reaches pruning or TT code.
 	bool boundsSound = true;
+	// The interval may be sound while public certification is forbidden by a
+	// provisional policy, experimental evaluator, or another safety gate.
+	bool certificationBlocked = false;
+};
+
+struct BoundMergeResult {
+	ExactScore score;
+	bool contradiction = false;
 };
 
 // Intersect two resumable results without allowing an old timeout to erase a
 // proof that a later slice (or another worker) has already established.  An
 // unsound interval is never used to tighten a sound one.  `certified` is kept
-// monotone in the useful direction: a point interval becomes certified when
-// at least one sound slice supplied a proof, while a later wide slice cannot
-// revoke that proof.
-inline ExactScore mergeSoundBounds(const ExactScore& previous, const ExactScore& fresh) {
-	if (!fresh.boundsSound) return previous;
-	if (!previous.boundsSound) return fresh;
+// A point interval is certified when the intersected sound slices prove a
+// single value, while a later wide slice cannot revoke that proof.
+inline BoundMergeResult mergeSoundBounds(const ExactScore& previous, const ExactScore& fresh) {
+	// Once an explicit contradiction has been observed, it must not be healed
+	// by a later slice.  A merely unsound estimate, on the other hand, is
+	// ignored so that it cannot weaken an already sound interval.
+	if (!fresh.boundsSound) {
+		if (fresh.certificationBlocked) return { fresh, true };
+		return { previous, false };
+	}
+	if (!previous.boundsSound) {
+		if (previous.certificationBlocked) return { previous, true };
+		return { fresh, false };
+	}
 	ExactScore result = previous;
 	if (ExactCompare(fresh.lower, result.lower) > 0) result.lower = fresh.lower;
 	if (ExactCompare(fresh.upper, result.upper) < 0) result.upper = fresh.upper;
-	if (ExactCompare(result.lower, result.upper) > 0) return ExactScore{};
+	if (ExactCompare(result.lower, result.upper) > 0) {
+		ExactScore invalid;
+		invalid.boundsSound = false;
+		invalid.certified = false;
+		invalid.certificationBlocked = true;
+		return { invalid, true };
+	}
 	if (!fresh.action.empty()) result.action = fresh.action;
 	result.boundsSound = true;
-	result.certified = (previous.certified || fresh.certified)
+	result.certificationBlocked = previous.certificationBlocked || fresh.certificationBlocked;
+	// Certification here means that the sound interval has become a point.
+	// It must not depend on either slice having independently finished: two
+	// incomplete but sound slices can intersect at the exact value.
+	result.certified = !result.certificationBlocked
 		&& ExactCompare(result.lower, result.upper) == 0;
-	return result;
+	return { result, false };
 }
 
 struct ExactRootActionValue {
@@ -861,6 +887,7 @@ struct ExactMetrics {
 	unsigned long long entityFeatureCount = 0;
 	unsigned long long comboFeatureCount = 0;
 	unsigned long long provisionalOpponentPolicyNodes = 0;
+	unsigned long long boundContradictions = 0;
 	unsigned long long dynamicPartitionBuilds = 0;
 	unsigned long long dynamicPartitionFallbacks = 0;
 	unsigned long long dynamicPartitionCacheHits = 0;
@@ -944,6 +971,7 @@ inline bool ExactMetricsCanCertify(const ExactMetrics& metrics) {
 		&& !metrics.arithmeticOverflow
 		&& !metrics.hiddenInformationLeakDetected
 		&& metrics.provisionalOpponentPolicyNodes == 0
+		&& metrics.boundContradictions == 0
 		&& !metrics.v4PassiveDrawExperimental;
 }
 
@@ -1373,6 +1401,7 @@ public:
 
 	const ExactMetrics& currentMetrics() const { return metrics; }
 	bool resourceStopped() const { return metrics.memoryLimitReached; }
+	void noteBoundContradiction() { ++metrics.boundContradictions; }
 
 private:
 	struct ExactKnowledgeState {
@@ -2737,6 +2766,7 @@ private:
 		// (including provisional opponent policy and experimental V4) ran.
 		const bool certifiable = ExactMetricsCanCertify(metrics) && score.boundsSound;
 		ExactScore storedScore = score;
+		storedScore.certificationBlocked = storedScore.certificationBlocked || !certifiable;
 		storedScore.certified = storedScore.certified && certifiable;
 		actionValueCertified = actionValueCertified && certifiable;
 		bestActionCertified = bestActionCertified && certifiable;
@@ -3015,6 +3045,7 @@ private:
 		}
 		if (!ExactMetricsCanCertify(metrics)) {
 			decision.score.certified = false;
+			decision.score.certificationBlocked = true;
 			decision.actionValueCertified = false;
 			decision.bestActionCertified = false;
 			decision.exactValueCertified = false;
@@ -3024,13 +3055,19 @@ private:
 
 	ExactScore unknown() const { return {}; }
 
+	ExactScore blockedUnknown() const {
+		ExactScore result = unknown();
+		result.certificationBlocked = true;
+		return result;
+	}
+
 	ExactScore boundaryScore(const State& state, long long value) {
 		if (state.exact.provisionalOpponentPolicy) {
 			// A deterministic opponent choice is an estimate, not a minimax
 			// boundary.  Keep all downstream intervals sound by discarding the
 			// point estimate before it can enter pruning or a transposition table.
 			metrics.provisionalOpponentPolicyNodes++;
-			return unknown();
+			return blockedUnknown();
 		}
 		return { ExactFraction::integer(value), ExactFraction::integer(value), {}, true, true };
 	}
@@ -4233,7 +4270,7 @@ private:
 				else { value = evaluateBeliefInformationState(item.second, mass); evaluationCache.emplace(std::move(cacheKey), value); }
 					ExactScore leaf = policyCertified
 						? ExactScore{ ExactFraction::integer(value), ExactFraction::integer(value), {}, true, true }
-						: unknown();
+						: blockedUnknown();
 					if (!policyCertified) metrics.provisionalOpponentPolicyNodes++;
 					scores.push_back({ leaf, mass });
 				metrics.leaves++;
@@ -5972,7 +6009,9 @@ private:
 					partialBytes += bytes; partial->accountedBytes += bytes;
 					partial->actionBounds.emplace(actionKey, score);
 				} else {
-					found->second = mergeSoundBounds(found->second, score);
+					BoundMergeResult merged = mergeSoundBounds(found->second, score);
+					if (merged.contradiction) ++metrics.boundContradictions;
+					found->second = merged.score;
 					score = found->second;
 					metrics.resumedActionCount++;
 				}
