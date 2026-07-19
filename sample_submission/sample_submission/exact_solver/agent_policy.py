@@ -14,6 +14,7 @@ _last_turn = None
 last_decision = None
 _policy_cache = {}
 _evaluator_loaded = False
+_fallback_cards = None
 
 
 def _ensure_v3_evaluator() -> None:
@@ -72,27 +73,239 @@ def option_semantic_key(option):
     return canonical_bytes(data)
 
 
-def _fallback_score(option) -> int:
-    """Small deterministic evaluator used only when no proven native action exists."""
-    # OptionType numeric values are part of the public engine API.  Values favor
-    # irreversible progress while keeping End as the safe baseline.
-    return {
-        13: 10_000,  # Attack
-        9: 4_000,    # Evolve
-        8: 3_000,    # Attach
-        10: 2_500,   # Ability
-        7: 1_500,    # Play
-        12: 500,     # Retreat
-        14: 0,       # End
-    }.get(int(option.type), 0)
+def _fallback_database():
+    """Lazily load only public card metadata and replay action priors."""
+    global _fallback_cards
+    if _fallback_cards is None:
+        from battle_ai import CardDatabase
+        _fallback_cards = CardDatabase()
+    return _fallback_cards
 
 
-def _turn_slice_milliseconds(ctx: PolicyContext, is_new_turn: bool, usable_ms: int) -> int:
+def _visible_option_card_id(obs, option) -> int | None:
+    """Resolve an option identity only from zones visible to the acting player."""
+    try:
+        option_type = int(option.type)
+        if option_type == 13:  # Attack
+            return option.attackId
+        if option_type in (7, 8, 9):  # Play, attach, evolve from own hand
+            hand = obs.current.players[obs.current.yourIndex].hand or ()
+            return hand[int(option.index)].id
+        if option_type not in (3, 10):  # Card or Ability
+            return option.cardId
+        player_index = (obs.current.yourIndex if option.playerIndex is None
+                        else int(option.playerIndex))
+        player = obs.current.players[player_index]
+        area = int(option.area)
+        index = int(option.index or 0)
+        if area == 1 and obs.select.deck is not None:
+            card = obs.select.deck[index]
+            return None if card is None else card.id
+        if area == 2 and player.hand is not None:
+            return player.hand[index].id
+        if area == 3:
+            return player.discard[index].id
+        if area == 4:
+            pokemon = player.active[index]
+            return None if pokemon is None else pokemon.id
+        if area == 5:
+            return player.bench[index].id
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
+    return option.cardId
+
+
+def _in_play_target(obs, option):
+    try:
+        player = obs.current.players[obs.current.yourIndex]
+        area = int(option.inPlayArea)
+        index = int(option.inPlayIndex or 0)
+        if area == 4:
+            return player.active[index]
+        if area == 5:
+            return player.bench[index]
+    except (AttributeError, IndexError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _fallback_score(obs, option) -> float:
+    """Observation-safe tactical ordering when the exact policy is unavailable."""
+    from battle_ai import option_score
+    from cg.api import AreaType, EnergyType, OptionType, SelectContext
+
+    cards = _fallback_database()
+    context = SelectContext(int(obs.select.context))
+    option_type = OptionType(int(option.type))
+    card_id = _visible_option_card_id(obs, option)
+    score = float(option_score(
+        obs, option, cards, obs.current.yourIndex
+    ))
+
+    # This deck needs a Supporter on its first turn more than the one-turn
+    # evolution lead.  The replay prior agrees: going second is the stable
+    # default for the checked-in Alakazam list.
+    if context == SelectContext.IS_FIRST:
+        return 1_000_000.0 if option_type == OptionType.NO else -1_000_000.0
+
+    # Do not expose a two-Prize support Pokémon as the opening Active.  Prefer
+    # Dunsparce, which can pivot or evolve into the deck's draw engine, followed
+    # by Abra, which advances the main attacker.
+    if context == SelectContext.SETUP_ACTIVE_POKEMON:
+        return score + {
+            305: 400.0,  # Dunsparce
+            741: 300.0,  # Abra
+            343: 100.0,  # Shaymin
+            140: -500.0,  # Fezandipiti ex
+        }.get(card_id, 0.0)
+
+    # Bench search should establish evolution lines before consuming slots with
+    # support Pokémon.  These identities are visible search results, not hidden
+    # deck materializations.
+    if context in (SelectContext.SETUP_BENCH_POKEMON,
+                   SelectContext.TO_BENCH,
+                   SelectContext.TO_FIELD):
+        score += {
+            741: 300.0,  # Abra
+            305: 240.0,  # Dunsparce
+            343: 80.0,   # Shaymin
+            140: -80.0,  # Fezandipiti ex
+        }.get(card_id, 0.0)
+
+    # Sacred Ash's TO_DECK selection is recovery, not a hand-reset cost.
+    effect_id = getattr(obs.select.effect, "id", None)
+    if context == SelectContext.TO_DECK and effect_id == 1129:
+        score = cards.card_value(card_id)
+
+    if context == SelectContext.MAIN and option_type == OptionType.ABILITY:
+        player = obs.current.players[obs.current.yourIndex]
+        # Run Away Draw shuffles Dudunsparce itself away.  If it is the only
+        # Pokémon in play, using it loses immediately for having no Active.
+        if (card_id == 66 and int(option.area) == int(AreaType.ACTIVE)
+                and not player.bench):
+            return -10_000_000.0
+        # Both draw Abilities are normally strongest before committing to an
+        # attack because the new cards can change every later legal choice.
+        if card_id in (66, 140):
+            score += 160.0
+
+    if context == SelectContext.MAIN and option_type == OptionType.EVOLVE:
+        # Kadabra and Alakazam draw on evolution; Dudunsparce unlocks the
+        # reusable draw engine.  Resolve these before an already-available
+        # low-damage attack.
+        score += 170.0 if card_id in (66, 742, 743) else 100.0
+
+    if context == SelectContext.MAIN and option_type == OptionType.PLAY:
+        # Deck-specific sequencing for the fixed submission list.  Search and
+        # evolution setup belong before attacking; reactive gust is deliberately
+        # left below an available attack unless exact search proves the line.
+        score += {
+            741: 120.0,   # Abra
+            305: 110.0,   # Dunsparce
+            1079: 190.0,  # Rare Candy
+            1081: 80.0,   # Enhanced Hammer
+            1086: 150.0,  # Buddy-Buddy Poffin
+            1097: 80.0,   # Night Stretcher
+            1129: 60.0,   # Sacred Ash
+            1152: 140.0,  # Poké Pad
+            1184: 90.0,   # Lana's Aid
+            1197: 90.0,   # Xerosic's Machinations
+            1225: 170.0,  # Hilda
+            1231: 180.0,  # Dawn
+        }.get(card_id, 0.0)
+
+    if context == SelectContext.MAIN and option_type == OptionType.ATTACH:
+        target = _in_play_target(obs, option)
+        target_data = cards.card(target.id) if target is not None else None
+        player = obs.current.players[obs.current.yourIndex]
+        if card_id == 13:  # Enriching Energy: attaching draws four.
+            score += 300.0
+        elif card_id == 19:  # Telepath Psychic Energy
+            if (target_data is not None
+                    and int(target_data.energyType) == int(EnergyType.PSYCHIC)
+                    and len(player.bench) < player.benchMax):
+                score += 260.0
+            else:
+                score -= 120.0
+        if target is not None and target.id == 66:
+            # An attached card is shuffled away by Run Away Draw.
+            score -= 100.0
+
+    if context == SelectContext.MAIN and option_type == OptionType.ATTACK:
+        if option.attackId == 1072:  # Alakazam: Powerful Hand
+            # The printed attack has zero base damage because it places
+            # counters.  Its actual output is 20 per card in hand.
+            score += max(0.0, 40.0 * obs.current.players[
+                obs.current.yourIndex
+            ].handCount - 44.0)
+        elif option.attackId == 183:  # Fezandipiti ex: Cruel Arrow
+            score += 156.0  # Treat the printed effect as its actual 100 damage.
+    return score
+
+
+def _force_max_fallback_choices(obs) -> bool:
+    from cg.api import SelectContext
+    context = SelectContext(int(obs.select.context))
+    if context in (
+        SelectContext.TO_BENCH,
+        SelectContext.TO_FIELD,
+        SelectContext.TO_HAND,
+        SelectContext.LOOK,
+        SelectContext.HEAL,
+        SelectContext.REMOVE_DAMAGE_COUNTER,
+        SelectContext.TO_HAND_ENERGY,
+    ):
+        return True
+    return (context == SelectContext.TO_DECK
+            and getattr(obs.select.effect, "id", None) == 1129)
+
+
+def _fallback_action(obs) -> list[int]:
+    """Choose a legal deterministic action without enumerating combinations."""
+    select = obs.select
+    option_count = len(select.option)
+    ranked = sorted(range(option_count), key=lambda index: (
+        -_fallback_score(obs, select.option[index]),
+        option_semantic_key(select.option[index]),
+        index,
+    ))
+    # These are benefit selections reached only after the card/effect was
+    # already committed.  Replay log-odds are useful for ranking identities,
+    # but must not turn a low-frequency Energy or Basic into "take zero".
+    if _force_max_fallback_choices(obs):
+        return sorted(ranked[:select.maxCount])
+    prefix_score = 0.0
+    candidates = []
+    for count in range(0, select.maxCount + 1):
+        if count > 0:
+            prefix_score += _fallback_score(obs, select.option[ranked[count - 1]])
+        if count < select.minCount:
+            continue
+        action = sorted(ranked[:count])
+        candidates.append((
+            -prefix_score,
+            count,
+            tuple(sorted(option_semantic_key(select.option[i]) for i in action)),
+            action,
+        ))
+    if not candidates:
+        raise ValueError("observation has no legal fallback cardinality")
+    return min(candidates)[-1]
+
+
+def _turn_slice_milliseconds(ctx: PolicyContext, is_new_turn: bool, usable_ms: int,
+                             allow_reroot: bool = False) -> int:
     """Return this call's slice while enforcing one absolute per-turn cap."""
     turn_cap = int(os.environ.get("PTCG_EXACT_TURN_MS", "90000"))
     selection_cap = int(os.environ.get("PTCG_EXACT_SELECTION_MS", "5000"))
     remaining_turn_ms = turn_cap - int(ctx.turn_search_seconds * 1000)
     if remaining_turn_ms <= 0:
+        # ExactTurnAdvance checks the retained observation-keyed policy before
+        # it resumes search.  Permit that cache lookup even after the expansion
+        # budget is spent; otherwise the expensive full-turn policy is thrown
+        # away after only its first action.
+        if allow_reroot:
+            return 1
         raise RuntimeError("exact turn search budget reached")
     return max(1, min(remaining_turn_ms, turn_cap if is_new_turn else selection_cap, usable_ms))
 
@@ -102,11 +315,6 @@ def _turn_owner(current) -> int | None:
     if current is None or current.turn <= 0 or current.firstPlayer not in (0, 1):
         return None
     return current.firstPlayer if current.turn % 2 == 1 else 1 - current.firstPlayer
-
-
-def _fixed_opponent_turn_action(select) -> list[int]:
-    """Choose one stable legal representative without inspecting hidden identity."""
-    return list(range(select.minCount))
 
 
 def choose_action(obs, *, context: PolicyContext | None = None,
@@ -138,8 +346,8 @@ def choose_action(obs, *, context: PolicyContext | None = None,
     # Effects resolved during the opponent's turn can ask this process to choose
     # a promotion, discard, switch target, and similar options.  They are outside
     # the own-turn planning objective.  Starting a 90-second ExactTurnSession for
-    # them consumed most of the match clock in real episodes, so use the fixed
-    # lowest-index legal representative requested for the submission policy.
+    # them consumed most of the match clock in real episodes, so use the
+    # observation-safe tactical policy without starting a native session.
     owner = _turn_owner(obs.current)
     if owner is not None and owner != obs.current.yourIndex:
         if ctx.session_id is not None:
@@ -150,8 +358,8 @@ def choose_action(obs, *, context: PolicyContext | None = None,
                 pass
             ctx.session_id = None
         ctx.last_turn = None
-        return finish(_fixed_opponent_turn_action(select), False,
-                      "fixed-opponent-turn-selection")
+        return finish(_fallback_action(obs), False,
+                      "heuristic-opponent-turn-selection")
     if select.minCount == select.maxCount == 0: return finish([], True, "forced-empty")
     if select.minCount == select.maxCount == option_count:
         return finish(list(range(option_count)), True, "forced-all")
@@ -169,7 +377,10 @@ def choose_action(obs, *, context: PolicyContext | None = None,
         hand_values = [int(values.get(str(card_id), values.get("default", 100))) for card_id in profile.cards]
         is_new_turn = obs.current is not None and obs.current.turn != ctx.last_turn
         usable_ms = max(1, int((ctx.budget.remaining - ctx.budget.limits.reserve_seconds) * 1000))
-        requested_ms = _turn_slice_milliseconds(ctx, is_new_turn, usable_ms)
+        requested_ms = _turn_slice_milliseconds(
+            ctx, is_new_turn, usable_ms,
+            allow_reroot=ctx.session_id is not None and not is_new_turn,
+        )
         if is_new_turn:
             if ctx.session_id is not None:
                 exact_turn_release(ctx.session_id)
@@ -196,33 +407,19 @@ def choose_action(obs, *, context: PolicyContext | None = None,
             if context is None:
                 _last_turn = ctx.last_turn
                 last_decision = native
-            return finish(action, bool(native["certified"]), reason)
+            # A partial root interval can select whichever branch happened to
+            # receive the first useful lower bound.  It is safe as an interval,
+            # but it is not a proof that the action is best.  Keep the native
+            # session and metrics for the next re-root, while using the tactical
+            # policy until the argmax itself has been certified.
+            if bool(native.get("bestActionCertified", native.get("certified", False))):
+                return finish(action, bool(native["certified"]), reason)
+            native_failure = "native best action is not certified"
     except Exception as error:
         native_failure = f"{type(error).__name__}: {error}"
     # O(n log n), including variable-cardinality selections.  Enumerating every
     # combination here used to make the emergency path itself exceed the clock
     # on large search lists.
-    ranked = sorted(range(option_count), key=lambda index: (
-        -_fallback_score(select.option[index]),
-        option_semantic_key(select.option[index]),
-        index,
-    ))
-    prefix_score = 0
-    candidates = []
-    for count in range(0, select.maxCount + 1):
-        if count > 0:
-            prefix_score += _fallback_score(select.option[ranked[count - 1]])
-        if count < select.minCount:
-            continue
-        action = sorted(ranked[:count])
-        candidates.append((
-            -prefix_score,
-            tuple(sorted(option_semantic_key(select.option[i]) for i in action)),
-            count,
-            action,
-        ))
-    if not candidates:
-        raise ValueError("observation has no legal fallback cardinality")
-    best = min(candidates)[-1]
+    best = _fallback_action(obs)
     return finish(best, False, f"emergency-policy: {native_failure}")
 
