@@ -280,11 +280,34 @@ private:
 			pod(player.playerIndex); pod(player.koPrizeOnceChanged); pod(player.thisTurn.value); pod(player.nextTurn.value);
 			pod(player.activeState); pod(player.continualState); pod(player.turnState);
 		}
+		// Deferred frames are an ABI-level int tuple, but the tuple's meaning is
+		// part of the state identity.  Do not put raw CardRef indices into the
+		// binary scalar image: those indices are allocation artifacts and would
+		// prevent equivalent states from sharing a DAG node.  The semantic blob
+		// below converts CardReference arguments through the same card token used
+		// by the rest of this canonicalizer.
+		std::string deferredFunctions;
 		for (const GameFunction& function : scalar.functionStack) {
-			pod(function.functionIndex); pod(function.arg0); pod(function.arg1); pod(function.arg2);
+			pod(function.functionIndex);
 			pod(function.argType); pod(function.callCount); pod(function.calledCount);
+			const DeferredArgSemantics semantics = DeferredSemanticsFor(function);
+			const int values[3] = { function.arg0, function.arg1, function.arg2 };
+			const int argumentCount = function.argType == ArgType::None ? 0
+				: (function.argType == ArgType::I || function.argType == ArgType::B ? 1
+					: (function.argType == ArgType::II ? 2 : 3));
+			appendInt(deferredFunctions, argumentCount);
+			for (int i = 0; i < argumentCount; ++i) {
+				appendInt(deferredFunctions, (int)semantics[(size_t)i]);
+				if (semantics[(size_t)i] == DeferredArgSemantic::CardReference
+					&& values[i] > 0 && values[i] < (int)state.allCard.size()) {
+					appendBlob(deferredFunctions, shallowCard(CardRef(values[i])));
+				} else {
+					appendInt(deferredFunctions, values[i]);
+				}
+			}
 		}
 		std::string result((const char*)writer.buf.data(), writer.buf.size());
+		appendBlob(result, deferredFunctions);
 
 		appendBlob(result, cardToken(state.contextCard));
 		appendBlob(result, cardToken(state.selectingEnergyPokemonRef));

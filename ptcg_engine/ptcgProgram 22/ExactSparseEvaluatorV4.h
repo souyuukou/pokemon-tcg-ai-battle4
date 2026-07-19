@@ -170,6 +170,7 @@ public:
 	bool isLoaded() const { return loaded; }
 	bool isStandalone() const { return standalone; }
 	bool manifestInformationSetSafe() const { return loaded && manifestSafe; }
+	bool manifestBoundaryOnly() const { return loaded && manifestSafe && manifest.boundaryOnly != 0; }
 	bool hasV3Trunk() const { return v3Trunk != nullptr; }
 	int modelSchemaVersion() const { return ModelSchemaVersion; }
 	int featureSchemaVersion() const { return FeatureSchemaVersion; }

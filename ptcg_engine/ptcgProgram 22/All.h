@@ -17,6 +17,10 @@ inline void InitializeAll() {
   assert(CardTable.size() == 0);
   assert(FunctionTable.size() == 0);
   InitializeBattleFunction();
+  // Complete the deferred-effect registry before any search worker can start.
+  // ExactEnsureDeferredFunctionRegistry is call_once guarded for later lazy
+  // callers, but missing symbols are still a startup error here.
+  ExactEnsureDeferredFunctionRegistry();
 
   CardImpl();
 	InitializeCard();

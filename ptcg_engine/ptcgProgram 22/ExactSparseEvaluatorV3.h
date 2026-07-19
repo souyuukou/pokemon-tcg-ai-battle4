@@ -225,6 +225,7 @@ public:
 
 	bool isLoaded() const { return loaded; }
 	bool manifestInformationSetSafe() const { return loaded && manifestSafe; }
+	bool manifestBoundaryOnly() const { return loaded && manifestSafe && manifest.boundaryOnly != 0; }
 	std::uint64_t modelHash() const { return modelHashValue; }
 	const std::string& path() const { return modelPath; }
 	size_t residentBytes() const {

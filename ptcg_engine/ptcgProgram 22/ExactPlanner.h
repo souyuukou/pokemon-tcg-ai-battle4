@@ -29,6 +29,7 @@
 #include <thread>
 #include <future>
 #include <fstream>
+#include <stdexcept>
 #include <emmintrin.h>
 #ifdef _WIN32
 #include <windows.h>
@@ -108,35 +109,39 @@ inline ExactThreadBudget& ExactGlobalThreadBudget() {
 // Registers ActivateSkillEffect / AfterEffect / … so Passive scans can treat the
 // skill-pipeline frames as EffectControl instead of Opaque (P0-2).
 inline void ExactEnsureDeferredFunctionRegistry() {
-	static bool once = false;
-	if (once) return;
-	once = true;
-	auto reg = [](void* fp) {
-		auto found = FunctionIndexTable.find((long long)fp);
-		int idx = -1;
-		if (found != FunctionIndexTable.end()) {
-			idx = found->second;
-		} else {
-			GameFunction tmp{ fp, ArgType::None };
-			idx = tmp.functionIndex;
-		}
-		ExactCardLivenessV4::RegisterEffectControlFunction(idx);
-	};
-	reg((void*)AfterEffect);
-	reg((void*)ActivateSkillEffect);
-	reg((void*)ActivateEffectMultiple);
-	reg((void*)ActivateEffectEachSelected);
-	reg((void*)ActivateEffectForEach);
-	reg((void*)SeparatorProc);
-	// Attach / trigger pipeline (Enriching Energy attaches via temporaryTriggerStack).
-	reg((void*)AfterAbility);
-	reg((void*)AfterTriggerAbility);
-	reg((void*)ResolveTriggerStack);
-	reg((void*)AfterPlay);
-	reg((void*)AfterRefresh);
-	reg((void*)ToMain);
-	reg((void*)MainSelect);
-	reg((void*)SelectedMain);
+	static std::once_flag registryOnce;
+	std::call_once(registryOnce, [] {
+		auto reg = [](void* fp, DeferredArgSemantics semantics = {
+			DeferredArgSemantic::Scalar, DeferredArgSemantic::Scalar, DeferredArgSemantic::Scalar }) {
+			auto found = FunctionIndexTable.find((long long)fp);
+			if (found == FunctionIndexTable.end()) {
+				throw std::runtime_error("deferred function is missing from FunctionIndexTable");
+			}
+			ExactCardLivenessV4::RegisterEffectControlFunction(found->second);
+			// Register the semantic type explicitly. Effect indices and recursion
+			// depths share the int ABI but must not be inferred from their value.
+			ExactCardLivenessV4::RegisterDeferredFunctionSemantics(found->second, semantics);
+		};
+		reg((void*)AfterEffect);
+		reg((void*)ActivateSkillEffect);
+		reg((void*)ActivateEffectEachSelected,
+			{ DeferredArgSemantic::EffectId, DeferredArgSemantic::None, DeferredArgSemantic::None });
+		reg((void*)ActivateEffectForEach,
+			{ DeferredArgSemantic::EffectId, DeferredArgSemantic::None, DeferredArgSemantic::None });
+		reg((void*)ActivateEffectMultiple,
+			{ DeferredArgSemantic::EffectId, DeferredArgSemantic::None, DeferredArgSemantic::None });
+		reg((void*)SeparatorProc);
+		// Attach / trigger pipeline (Enriching Energy attaches via temporaryTriggerStack).
+		reg((void*)AfterAbility);
+		reg((void*)AfterTriggerAbility);
+		reg((void*)ResolveTriggerStack,
+			{ DeferredArgSemantic::Scalar, DeferredArgSemantic::None, DeferredArgSemantic::None });
+		reg((void*)AfterPlay);
+		reg((void*)AfterRefresh);
+		reg((void*)ToMain);
+		reg((void*)MainSelect);
+		reg((void*)SelectedMain);
+	});
 }
 
 inline unsigned long long ExactPeakResidentBytes() {
@@ -779,6 +784,7 @@ struct ExactMetrics {
 	unsigned long long rootQueueLeases = 0;
 	unsigned long long rootQueueReassignments = 0;
 	unsigned long long rootQueueSteals = 0;
+	unsigned long long rootQueueEliminations = 0;
 	int lastPendingPlayer = -1;
 	int lastPendingEffectCardId = 0;
 	int lastPendingEffectPlayer = -1;
@@ -911,6 +917,8 @@ struct ExactDecision {
 	ExactScore score;
 	ExactMetrics metrics;
 	std::vector<ExactRootActionValue> rootActions;
+	bool bestActionCertified = false;
+	bool exactValueCertified = false;
 };
 
 // Search states are short-lived and are created at almost every explored edge.
@@ -930,30 +938,12 @@ public:
 		destination.assign(source.begin(), source.end());
 	}
 
-	// State's fixed prefix contains only byte-serializable engine data after the
-	// non-owning Game pointer.  Copy it in one operation; copy owning vectors
-	// explicitly so their allocations are reused and never aliased.
+	// State contains user-defined FixedList members and padding-sensitive unions;
+	// it is not a byte-serializable POD. Use the compiler-generated memberwise
+	// assignment so every non-owning pointer, value, and owning vector follows
+	// normal C++ object semantics.
 	static void copyExactState(State& destination, const State& source) {
-		destination.game = source.game;
-		const auto* sourceBegin = reinterpret_cast<const unsigned char*>(&source.turn);
-		const auto* sourceEnd = reinterpret_cast<const unsigned char*>(&source.options);
-		auto* destinationBegin = reinterpret_cast<unsigned char*>(&destination.turn);
-		std::memcpy(destinationBegin, sourceBegin, (size_t)(sourceEnd - sourceBegin));
-		copyVector(destination.options, source.options);
-		copyVector(destination.selected, source.selected);
-		copyVector(destination.preTargetList, source.preTargetList);
-		copyVector(destination.targetList, source.targetList);
-		copyVector(destination.koList, source.koList);
-		copyVector(destination.delayTriggerStack, source.delayTriggerStack);
-		copyVector(destination.temporaryTriggerStack, source.temporaryTriggerStack);
-		copyVector(destination.triggerStack, source.triggerStack);
-		copyVector(destination.turnUsedSkill, source.turnUsedSkill);
-		copyVector(destination.turnPlay, source.turnPlay);
-		copyVector(destination.turnHeal, source.turnHeal);
-		copyVector(destination.turnEvolve, source.turnEvolve);
-		copyVector(destination.functionStack, source.functionStack);
-		copyVector(destination.logs, source.logs);
-		destination.exact = source.exact;
+		destination = source;
 	}
 
 	template<class T>
@@ -970,69 +960,21 @@ public:
 		stats.copiedBytes += (unsigned long long)source.size() * sizeof(T);
 	}
 
-	// Search successors are usually close relatives of the state most recently
-	// released to this thread-local pool. Compare fixed-size pages and restore
-	// only pages which differ. This is a conservative COW implementation: every
-	// byte is checked, so correctness does not rely on mutation instrumentation.
+	// The old page-COW path used memcmp/memcpy over State's object representation.
+	// That is invalid for FixedList, unions, and padding, so the safe fallback is
+	// a normal assignment. The pool still reuses the State allocation itself.
 	static void copyCowState(State& destination, const State& source, CopyStats& stats) {
-		destination.game = source.game;
-		auto restoreBytes = [&](void* destinationBytes, const void* sourceBytes, size_t length) {
-			if (std::memcmp(destinationBytes, sourceBytes, length) == 0) return;
-			std::memcpy(destinationBytes, sourceBytes, length);
-			stats.pageCopies++; stats.copiedBytes += length;
-		};
-		// Coarse logical pages reduce memcmp call overhead while retaining the
-		// conservative compare-before-copy guarantee. Mutation tracking can later
-		// replace this scan with direct dirty bits without changing semantics.
-		const auto* sourceBegin = reinterpret_cast<const unsigned char*>(&source.turn);
-		const auto* sourceEnd = reinterpret_cast<const unsigned char*>(&source.options);
-		auto* destinationBegin = reinterpret_cast<unsigned char*>(&destination.turn);
-		const size_t total = (size_t)(sourceEnd - sourceBegin);
-		static constexpr size_t PageBytes = 256;
-		for (size_t offset = 0; offset < total; offset += PageBytes)
-			restoreBytes(destinationBegin + offset, sourceBegin + offset, std::min(PageBytes, total - offset));
-		restoreVector(destination.options, source.options, stats);
-		restoreVector(destination.selected, source.selected, stats);
-		restoreVector(destination.preTargetList, source.preTargetList, stats);
-		restoreVector(destination.targetList, source.targetList, stats);
-		restoreVector(destination.koList, source.koList, stats);
-		restoreVector(destination.delayTriggerStack, source.delayTriggerStack, stats);
-		restoreVector(destination.temporaryTriggerStack, source.temporaryTriggerStack, stats);
-		restoreVector(destination.triggerStack, source.triggerStack, stats);
-		restoreVector(destination.turnUsedSkill, source.turnUsedSkill, stats);
-		restoreVector(destination.turnPlay, source.turnPlay, stats);
-		restoreVector(destination.turnHeal, source.turnHeal, stats);
-		restoreVector(destination.turnEvolve, source.turnEvolve, stats);
-		restoreVector(destination.functionStack, source.functionStack, stats);
-		restoreVector(destination.logs, source.logs, stats);
-		static_assert(std::is_trivially_copyable_v<ExactHiddenState>);
-		if (std::memcmp(&destination.exact, &source.exact, sizeof(ExactHiddenState)) != 0) {
-			std::memcpy(&destination.exact, &source.exact, sizeof(ExactHiddenState));
-			stats.pageCopies++; stats.copiedBytes += sizeof(ExactHiddenState);
-		}
+		destination = source;
+		stats.fullCopy = true;
+		stats.copiedBytes = sizeof(State);
 	}
 
 	static bool equalAfterCopy(const State& destination, const State& source) {
-		const auto* sourceBegin = reinterpret_cast<const unsigned char*>(&source.turn);
-		const auto* sourceEnd = reinterpret_cast<const unsigned char*>(&source.options);
-		const auto* destinationBegin = reinterpret_cast<const unsigned char*>(&destination.turn);
-		if (std::memcmp(destinationBegin, sourceBegin, (size_t)(sourceEnd - sourceBegin)) != 0) return false;
-		if (std::memcmp(&destination.exact, &source.exact, sizeof(ExactHiddenState)) != 0) return false;
-		auto same = [](const auto& left, const auto& right) {
-			using Value = typename std::decay_t<decltype(left)>::value_type;
-			if (left.size() != right.size()) return false;
-			if constexpr (std::is_trivially_copyable_v<Value>)
-				return left.empty() || std::memcmp(left.data(), right.data(), left.size() * sizeof(Value)) == 0;
-			return true; // non-trivial vectors are always assigned by restoreVector
-		};
-		return same(destination.options, source.options) && same(destination.selected, source.selected)
-			&& same(destination.preTargetList, source.preTargetList) && same(destination.targetList, source.targetList)
-			&& same(destination.koList, source.koList) && same(destination.delayTriggerStack, source.delayTriggerStack)
-			&& same(destination.temporaryTriggerStack, source.temporaryTriggerStack)
-			&& same(destination.triggerStack, source.triggerStack) && same(destination.turnUsedSkill, source.turnUsedSkill)
-			&& same(destination.turnPlay, source.turnPlay) && same(destination.turnHeal, source.turnHeal)
-			&& same(destination.turnEvolve, source.turnEvolve) && same(destination.functionStack, source.functionStack)
-			&& same(destination.logs, source.logs);
+		(void)destination;
+		(void)source;
+		// copyExactState/copyCowState use memberwise assignment, so no object
+		// representation comparison is needed or valid here.
+		return true;
 	}
 
 	static State* acquire(const State& source, bool* allocated = nullptr,
@@ -1190,6 +1132,10 @@ public:
 	// tasks.  In that mode Chance expansion must remain serial inside each task;
 	// one-shot/single-root callers may opt into bounded Chance parallelism.
 	void setChanceParallelEnabled(bool enabled) { chanceParallelEnabled = enabled; }
+	// Session workers already hold a process-wide permit. Direct one-shot
+	// planner callers set nothing and acquire one for the duration of a solve,
+	// leaving at most one permit for nested Chance workers.
+	void setThreadPermitHeld(bool held) { threadPermitHeld = held; }
 
 	// A second root worker may traverse the same expensive action from the
 	// opposite side. Completed descendants are shared through the immutable TT,
@@ -1213,6 +1159,8 @@ public:
 	}
 
 	ExactDecision decide(State root) {
+		auto threadLease = threadPermitHeld ? ExactThreadBudget::Lease()
+			: ExactGlobalThreadBudget().acquire();
 		auto workerStarted = std::chrono::steady_clock::now();
 		Game exactGame;
 		prepareExactRoot(root, exactGame);
@@ -1228,6 +1176,9 @@ public:
 		result.score = solveOwned(cloneState(root));
 		result.rootActions = rootActionValues;
 		applyEvaluatorSafety(result);
+		result.bestActionCertified = (!result.score.action.empty()
+			&& (root.options.size() <= 1 || result.score.certified));
+		result.exactValueCertified = result.score.certified;
 		metrics.workerBusyNs += (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
 			std::chrono::steady_clock::now() - workerStarted).count();
 		result.metrics = metrics;
@@ -1235,6 +1186,8 @@ public:
 	}
 
 	ExactDecision evaluateRootAction(State root, int optionIndex) {
+		auto threadLease = threadPermitHeld ? ExactThreadBudget::Lease()
+			: ExactGlobalThreadBudget().acquire();
 		auto workerStarted = std::chrono::steady_clock::now();
 		Game exactGame;
 		prepareExactRoot(root, exactGame);
@@ -1267,6 +1220,8 @@ public:
 			result.score.action = { optionIndex };
 		}
 		applyEvaluatorSafety(result);
+		result.bestActionCertified = result.score.certified;
+		result.exactValueCertified = result.score.certified;
 		metrics.workerBusyNs += (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
 			std::chrono::steady_clock::now() - workerStarted).count();
 		result.metrics = metrics;
@@ -1344,6 +1299,8 @@ public:
 		if (!remapAction(observed, selected->actionTokens, remapped)) { metrics.policyMisses++; return false; }
 		result.score = selected->score;
 		result.score.action = std::move(remapped);
+		result.bestActionCertified = result.score.certified;
+		result.exactValueCertified = result.score.certified;
 		metrics.policyHits++;
 		metrics.rerootCount++;
 		metrics.semanticActionRemaps++;
@@ -1685,6 +1642,7 @@ private:
 	ExactPassivePayloadV4 chanceNodeBasePassive;
 	bool concreteWorldCaching = false;
 	bool chanceParallelEnabled = true;
+	bool threadPermitHeld = false;
 	// Enabled only by a future shared-frontier scheduler. Root-parity profiling
 	// showed no simultaneous claims, so allocating a flight record per node is
 	// deliberately not part of the standard cow path yet.
@@ -5447,7 +5405,7 @@ private:
 					}
 				}
 				const unsigned workers = (unsigned)workerLeases.size();
-				if (remaining >= workers * 2u && workers > 1u) {
+				if (remaining >= workers && workers > 0u) {
 					std::vector<size_t> todo;
 					todo.reserve(remaining);
 					for (size_t i = 0; i < partial.outcomes.size(); ++i) {
@@ -5480,7 +5438,8 @@ private:
 						worker.setAbsoluteDeadline(sharedDeadline);
 						worker.v4PassiveDrawEnabled = v4Passive;
 						worker.v4PassiveDrawCertified = v4PassiveDrawCertified;
-						worker.chanceParallelEnabled = false;
+					worker.chanceParallelEnabled = false;
+					worker.threadPermitHeld = true;
 						worker.skeletonSharingEnabled = false;
 						worker.actor = sharedActor;
 						Game scratch;

@@ -1,0 +1,57 @@
+name: exact-engine-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux-sanitizers:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, undefined, thread]
+    env:
+      CXXFLAGS: >-
+        -O1 -g -fno-omit-frame-pointer
+        ${{ matrix.sanitizer == 'thread' && '-fsanitize=thread' ||
+           matrix.sanitizer == 'undefined' && '-fsanitize=undefined' ||
+           '-fsanitize=address' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S boundary_ai -B build/ci-${{ matrix.sanitizer }} -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build/ci-${{ matrix.sanitizer }} --parallel 2
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir build/ci-${{ matrix.sanitizer }} --output-on-failure
+
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S boundary_ai -B build/ci-release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+      - name: Build and test
+        run: |
+          cmake --build build/ci-release --parallel 2
+          ctest --test-dir build/ci-release --output-on-failure
+
+  windows-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Debug STL
+        run: cmake -S boundary_ai -B build/ci-msvc -A x64 -DBUILD_TESTING=ON -DCMAKE_CXX_FLAGS="/D_ITERATOR_DEBUG_LEVEL=2"
+      - name: Build and test
+        run: |
+          cmake --build build/ci-msvc --config Debug --parallel 2
+          ctest --test-dir build/ci-msvc -C Debug --output-on-failure
+      - name: Build native submission DLL
+        shell: pwsh
+        run: |
+          msbuild "ptcg_engine/ptcgProgram 22/game.sln" /m:2 /p:Configuration=Release /p:Platform=x64

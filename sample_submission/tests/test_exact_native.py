@@ -8,7 +8,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "sample_sub
 sys.path.insert(0, ROOT)
 
 from cg.api import exact_decide, to_observation_class
-from cg.game import battle_finish, battle_select, battle_start
+from cg.game import battle_finish, battle_select, battle_start_seeded
 from exact_solver.profile import load_profile
 from exact_solver import agent_policy
 import main
@@ -27,7 +27,7 @@ class NativeExactSmokeTest(unittest.TestCase):
         old_selection_ms = os.environ.get("PTCG_EXACT_SELECTION_MS")
         os.environ["PTCG_EXACT_TURN_MS"] = "1000"
         os.environ["PTCG_EXACT_SELECTION_MS"] = "200"
-        raw, start = battle_start(list(profile.cards), list(profile.cards))
+        raw, start = battle_start_seeded(list(profile.cards), list(profile.cards), 17)
         self.assertEqual(-1, start.errorPlayer, start.errorType)
         try:
             # Progress through setup and one own-turn decision.  This reaches
@@ -73,6 +73,29 @@ class NativeExactSmokeTest(unittest.TestCase):
                 os.environ.pop("PTCG_EXACT_SELECTION_MS", None)
             else:
                 os.environ["PTCG_EXACT_SELECTION_MS"] = old_selection_ms
+
+    def test_single_legal_boundary_proves_best_action(self) -> None:
+        profile = load_profile()
+        raw, start = battle_start_seeded(list(profile.cards), list(profile.cards), 17)
+        self.assertEqual(-1, start.errorPlayer, start.errorType)
+        try:
+            for _ in range(96):
+                obs = to_observation_class(raw)
+                if obs.current.result >= 0:
+                    break
+                raw = battle_select(list(range(obs.select.minCount)))
+                obs = to_observation_class(raw)
+                if (obs.current.turn > 0
+                        and agent_policy._turn_owner(obs.current) == obs.current.yourIndex):
+                    if len(obs.select.option) == 1:
+                        decision = exact_decide(obs, list(profile.cards), [100] * len(profile.cards), 300)
+                        self.assertTrue(decision["bestActionCertified"])
+                        self.assertTrue(decision["exactValueCertified"])
+                        return
+                    raw = battle_select(list(range(obs.select.minCount)))
+            self.fail("did not reach a one-action boundary fixture")
+        finally:
+            battle_finish()
 
 
 if __name__ == "__main__":

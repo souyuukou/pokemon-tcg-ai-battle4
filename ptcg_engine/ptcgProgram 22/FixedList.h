@@ -36,6 +36,7 @@ public:
 	}
 
 	void push_front(const T& t) {
+		checkFull();
 		cnt++;
 		for (int i = cnt - 1; i >= 1; i--) {
 			buffer[i] = buffer[i - 1];
@@ -64,8 +65,8 @@ public:
 		return cnt == 0;
 	}
 
-	bool isFull() const {
-		return cnt == Capacity - 1;
+	bool isFull() const noexcept {
+		return cnt >= Capacity;
 	}
 
 	void resize(int newSize) {
@@ -136,6 +137,7 @@ public:
 	}
 
 	T take(int index) {
+		checkIndex(index);
 		T element = buffer[index];
 		remove(index);
 		return element;

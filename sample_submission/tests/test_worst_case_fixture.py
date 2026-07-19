@@ -71,6 +71,17 @@ class WorstCaseFixtureTest(unittest.TestCase):
             self.assertGreater(int(decision["streamingCursorHits"]), 0)
             self.assertGreater(int(decision["streamingCursorPeakBytes"]), 0)
             self.assertEqual(0, int(decision["chanceMassMismatches"]))
+            # The integrated native path must fail closed on every opaque or
+            # interrupted transition encountered by this rich fixture.
+            self.assertEqual(0, int(decision.get("opaqueNodes", 0)))
+            self.assertEqual(0, int(decision.get("unsupportedConcreteReferenceNodes", 0)))
+            self.assertEqual(0, int(decision.get("interruptedTransitionNodes", 0)))
+            self.assertEqual(0, int(decision.get("chanceMassMismatches", 0)))
+            # A time-sliced rich search may legitimately leave the argmax
+            # interval open; the field is nevertheless required and is tested
+            # for a positive proof in the deterministic boundary fixture.
+            self.assertIn("bestActionCertified", decision)
+            self.assertIn("exactValueCertified", decision)
         finally:
             battle_finish()
             if old_turn is None:

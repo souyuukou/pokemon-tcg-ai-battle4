@@ -36,16 +36,27 @@ boundaries.
 - Root branches are leased from a shared priority queue in bounded slices.
   Each task owns its planner and cursor, so a lease can move between workers
   without regenerating completed chance outcomes.
-- The process-wide `ExactThreadBudget(2)` reserves both permits before root
-  workers start; nested Chance async is disabled in root-parallel mode and
-  every one-shot Chance batch acquires permits before spawning workers.
+- The process-wide `ExactThreadBudget(2)` uses one blocking root permit and an
+  opportunistic second permit, so concurrent sessions cannot deadlock while
+  waiting for a pair. Nested Chance async is disabled in root-parallel mode
+  and every one-shot Chance batch acquires permits before spawning workers.
 - Large multi-card draws use a `MultiDrawCursor` count-vector generator. Only
   a bounded composition stack and the current outcome are retained; the legacy
   continuation vector is reserved for small spaces where it is memory-bounded.
 - Evaluator payloads carry a versioned manifest with feature/belief schema
   hashes, `informationSetSafe`, and `boundaryOnly`; load succeeds only after
   exact code-side validation.
+- Deferred function frames carry explicit argument semantics. Card-reference
+  arguments are canonicalized through semantic card tokens, while unknown
+  argument meanings fail closed during deferred-effect coverage scans.
+- `FixedList` boundary operations are checked before reads/writes, and State
+  snapshots use memberwise C++ assignment instead of raw object-representation
+  copies. Root results expose independent `bestActionCertified` and
+  `exactValueCertified` proofs.
 - Tests: probability normalization, compressed-vs-physical draw equivalence,
   MDD sharing, observation-contingent policy, TT merging, boundary-only Value,
   interval interruption, partial-order safety, adapter compilation, the
-  battle3 deck profile hash, and a native hidden-world smoke test.
+  battle3 deck profile hash, a native hidden-world smoke test, and a seeded
+  Dudunsparce/Kadabra/Alakazam draw-chain fixture with coverage and RSS guards.
+- CI runs GCC/Clang-style release and ASan/UBSan/TSan jobs plus MSVC Debug STL
+  and native Windows release builds.

@@ -370,6 +370,10 @@ inline void RegisterEffectControlFunction(int functionIndex) {
 	if (functionIndex >= 0) EffectControlFunctionIndices().insert(functionIndex);
 }
 
+inline void RegisterDeferredFunctionSemantics(int functionIndex, DeferredArgSemantics semantics) {
+	RegisterDeferredFunctionSemanticTableEntry(functionIndex, semantics);
+}
+
 // Short-term TypedDeferredFunction: EffectControl frames are safe relative to
 // Passive hand/deck reads (remaining effects are scanned separately). Any other
 // callback is Opaque → unknown + furtherChance.
@@ -384,6 +388,18 @@ inline CoverageResult ScanDeferredFunctionStack(const State& state) {
 		return r;
 	}
 	for (const GameFunction& gf : state.functionStack) {
+		const DeferredArgSemantics semantics = DeferredSemanticsFor(gf);
+		const int argumentCount = gf.argType == ArgType::None ? 0
+			: (gf.argType == ArgType::I || gf.argType == ArgType::B ? 1
+				: (gf.argType == ArgType::II ? 2 : 3));
+		for (int i = 0; i < argumentCount; ++i) {
+			if (semantics[(size_t)i] == DeferredArgSemantic::Unknown
+				|| semantics[(size_t)i] == DeferredArgSemantic::None) {
+				r.unknown = true;
+				r.impliesFurtherChance = true;
+				return r;
+			}
+		}
 		if (!ok.count(gf.functionIndex)) {
 			r.unknown = true;
 			r.impliesFurtherChance = true;

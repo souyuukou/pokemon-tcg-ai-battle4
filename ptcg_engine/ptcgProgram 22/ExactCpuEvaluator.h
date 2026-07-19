@@ -95,6 +95,13 @@ public:
 		return loaded && sparseV3.manifestInformationSetSafe()
 			&& (!sparseV4.isLoaded() || !sparseV4.isStandalone() || sparseV4.manifestInformationSetSafe());
 	}
+	// Keep the two safety claims independent in diagnostics.  A model may have
+	// an information-set-safe feature projection while still being trained for
+	// intermediate states; callers must not infer boundary-only from the former.
+	bool boundaryOnly() const {
+		return loaded && sparseV3.manifestBoundaryOnly()
+			&& (!sparseV4.isLoaded() || !sparseV4.isStandalone() || sparseV4.manifestBoundaryOnly());
+	}
 	std::uint64_t modelHash() const {
 		return usesV4Search() ? sparseV4.modelHash() : sparseV3.modelHash();
 	}
