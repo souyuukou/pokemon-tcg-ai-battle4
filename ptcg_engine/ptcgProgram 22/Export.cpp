@@ -596,6 +596,7 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
   j.appendCommaKey("upperNumerator"); AppendExactNumerator(j, decision.score.upper);
   j.appendCommaKey("upperDenominator"); AppendExactDenominator(j, decision.score.upper);
   j.appendCommaKeyValue("certified", decision.score.certified);
+  j.appendCommaKeyValue("boundsSound", decision.score.boundsSound);
   j.appendCommaKeyValue("actionValueCertified", decision.actionValueCertified);
   j.appendCommaKeyValue("bestActionCertified", decision.bestActionCertified);
   j.appendCommaKeyValue("exactValueCertified", decision.exactValueCertified);
@@ -1037,6 +1038,7 @@ struct ExactTurnSession {
     Game game;
     std::unique_ptr<ExactPlanner> planner;
     std::vector<ExactScore> actions;
+    std::vector<bool> visited;
     bool argmaxCut = false;
   };
 
@@ -1084,7 +1086,8 @@ struct ExactTurnSession {
       long double selectedPriority = -1.0L;
       for (int i = 0; i < (int)tasks.size(); ++i) {
         const RootTask& task = *tasks[i];
-        if (task.claimed || task.blocked || task.eliminated || task.score.certified) continue;
+        if (task.claimed || task.blocked || task.eliminated
+            || (task.score.certified && task.score.boundsSound)) continue;
         const bool intervalOpen = ExactCompare(task.score.upper, task.score.lower) > 0;
         const long double widthBonus = 1.0L
           + std::min(task.intervalWidth, 200'000'000.0L) / 200'000'000.0L;
@@ -1117,7 +1120,9 @@ struct ExactTurnSession {
         if (ExactCompare(fresh.lower, task.score.lower) > 0) task.score.lower = fresh.lower;
         if (ExactCompare(fresh.upper, task.score.upper) < 0) task.score.upper = fresh.upper;
         if (ExactCompare(task.score.lower, task.score.upper) > 0) task.score = ExactScore{};
-        else task.score.certified = ExactCompare(task.score.lower, task.score.upper) == 0;
+        else task.score.certified = task.score.certified && fresh.certified
+          && ExactCompare(task.score.lower, task.score.upper) == 0;
+        task.score.boundsSound = task.score.boundsSound && fresh.boundsSound;
         task.score.action = { task.option };
       }
       task.intervalWidth = remainingWidth(task.score);
@@ -1141,7 +1146,8 @@ struct ExactTurnSession {
       const ExactFraction bestLower = tasks[best]->score.lower;
       for (auto& item : tasks) {
         if (item->claimed || item->blocked || item->eliminated) continue;
-        if (ExactCompare(item->score.upper, bestLower) < 0) {
+        if (item->score.boundsSound && tasks[best]->score.boundsSound
+            && ExactCompare(item->score.upper, bestLower) < 0) {
           item->eliminated = true;
           ++eliminations;
         }
@@ -1152,7 +1158,8 @@ struct ExactTurnSession {
       std::lock_guard<std::mutex> lock(mutex);
       for (const auto& item : tasks) {
         if (item->claimed) return true;
-        if (!item->blocked && !item->eliminated && !item->score.certified) return true;
+        if (!item->blocked && !item->eliminated
+            && !(item->score.certified && item->score.boundsSound)) return true;
       }
       return false;
     }
@@ -1234,6 +1241,7 @@ struct ExactTurnSession {
 		output->planner->setChanceParallelEnabled(false);
 		output->planner->setThreadPermitHeld(true);
 		output->actions.resize(source.options.size());
+		output->visited.assign(source.options.size(), false);
 		std::vector<bool> structurallyBlocked(source.options.size(), false);
 		std::vector<int> assigned = workerAssignments[parity];
 		output->planner->setReverseActionOrder(parity == 0 && assigned.size() > 1);
@@ -1242,6 +1250,7 @@ struct ExactTurnSession {
 			for (int option : assigned) {
 				State local = source; local.game = &output->game;
 				output->actions[option] = output->planner->evaluateRootAction(local, option).score;
+				output->visited[option] = true;
 			}
 		} else {
 			int fairShare = std::max(50, budgetMilliseconds / std::max(1, (int)assigned.size()));
@@ -1264,11 +1273,16 @@ struct ExactTurnSession {
 					if (output->planner->currentMetrics().unknownOpponentList > unknownBefore)
 						structurallyBlocked[option] = true;
 					ExactScore& saved = output->actions[option];
-					if (saved.action.empty()) saved = fresh;
+					if (!output->visited[option]) {
+						saved = fresh;
+						output->visited[option] = true;
+					}
 					else {
 						if (ExactCompare(fresh.lower, saved.lower) > 0) saved.lower = fresh.lower;
 						if (ExactCompare(fresh.upper, saved.upper) < 0) saved.upper = fresh.upper;
-						saved.certified = ExactCompare(saved.lower, saved.upper) == 0;
+						saved.certified = saved.certified && fresh.certified
+							&& ExactCompare(saved.lower, saved.upper) == 0;
+						saved.boundsSound = saved.boundsSound && fresh.boundsSound;
 					}
 					attempted = true;
 					if (output->planner->resourceStopped()) { resourceStopped = true; break; }
@@ -1342,9 +1356,11 @@ struct ExactTurnSession {
 			  found->second.upper = item.upper;
 			if (item.certified && !existingCertified) representativeWorker[option] = wi;
 			if (ExactCompare(found->second.lower, found->second.upper) > 0) {
-			  found->second = ExactScore{};
+				found->second = ExactScore{};
 			} else {
-			  found->second.certified = ExactCompare(found->second.lower, found->second.upper) == 0;
+				found->second.certified = existingCertified && item.certified
+					&& ExactCompare(found->second.lower, found->second.upper) == 0;
+				found->second.boundsSound = found->second.boundsSound && item.boundsSound;
 			}
 		  }
         }
@@ -1366,6 +1382,9 @@ struct ExactTurnSession {
 			maxUpper = ExactFraction::integer(100'000'000);
 			continue;
 		}
+		if (representativeWorker.find(option) == representativeWorker.end()
+			|| !workers[representativeWorker[option]]->visited[option])
+			allRootTasksVisited = false;
 		ExactScore item = found->second; item.action = { option };
 		decision.rootActions.push_back({ item.action, item.lower, item.upper, item.certified });
 		if (first || ExactCompare(item.lower, decision.score.lower) > 0
@@ -1383,23 +1402,30 @@ struct ExactTurnSession {
 		decision.metrics.successorMerges++;
 		decision.metrics.largestEquivalenceClass = std::max<unsigned long long>(decision.metrics.largestEquivalenceClass, 2);
 	  }
-      decision.metrics.rootWorkers = rootLease1 ? 2 : 1;
+	  decision.metrics.rootWorkers = rootLease1 ? 2 : 1;
 	  if (!first) {
+		bool allOtherBoundsSound = true;
 		for (const auto& item : representativeScores) {
 			if (item.second.action.empty() || item.first == decision.score.action.front()) continue;
+			if (!item.second.boundsSound) allOtherBoundsSound = false;
 			if (!hasOtherUpper || ExactCompare(item.second.upper, maxOtherUpper) > 0) {
 				maxOtherUpper = item.second.upper;
 				hasOtherUpper = true;
 			}
 		}
 		decision.bestActionCertified = decision.metrics.informationSetSafe
+			&& ExactMetricsCanCertify(decision.metrics)
 			&& allRootTasksVisited
+			&& decision.score.boundsSound
+			&& allOtherBoundsSound
 			&& (!hasOtherUpper || ExactCompare(decision.score.lower, maxOtherUpper) >= 0);
 		decision.actionValueCertified = decision.metrics.informationSetSafe
-			&& ExactCompare(decision.score.lower, decision.score.upper) == 0;
+			&& ExactMetricsCanCertify(decision.metrics)
+			&& decision.score.boundsSound && decision.score.certified;
 		decision.exactValueCertified = decision.bestActionCertified
-			&& ExactCompare(decision.score.lower, decision.score.upper) == 0;
+			&& decision.actionValueCertified;
 		decision.score.upper = maxUpper;
+		decision.score.boundsSound = decision.score.boundsSound && allOtherBoundsSound;
 		decision.score.certified = decision.exactValueCertified;
 	  }
       int other = 1 - selectedWorker;
@@ -1543,23 +1569,31 @@ struct ExactTurnSession {
     if (!first) {
       ExactFraction maxOtherUpper;
       bool hasOtherUpper = false;
+		bool allOtherBoundsSound = true;
       for (const auto& task : queue.tasks) {
         if (task->eliminated || task->option == queue.tasks[selectedIndex]->option)
           continue;
+		if (!task->score.boundsSound) allOtherBoundsSound = false;
         if (!hasOtherUpper || ExactCompare(task->score.upper, maxOtherUpper) > 0) {
           maxOtherUpper = task->score.upper;
           hasOtherUpper = true;
         }
       }
       decision.bestActionCertified = decision.metrics.informationSetSafe
+		&& ExactMetricsCanCertify(decision.metrics)
         && queue.tasks[selectedIndex]->hasBeenVisited
+		&& queue.tasks[selectedIndex]->score.boundsSound
+		&& allOtherBoundsSound
         && (!hasOtherUpper
           || ExactCompare(decision.score.lower, maxOtherUpper) >= 0);
       decision.actionValueCertified = decision.metrics.informationSetSafe
-        && ExactCompare(decision.score.lower, decision.score.upper) == 0;
+		&& ExactMetricsCanCertify(decision.metrics)
+		&& queue.tasks[selectedIndex]->score.boundsSound
+		&& queue.tasks[selectedIndex]->score.certified;
       decision.exactValueCertified = decision.bestActionCertified
-        && ExactCompare(decision.score.lower, decision.score.upper) == 0;
+		&& decision.actionValueCertified;
       if (!decision.bestActionCertified) decision.score.upper = maxUpper;
+		decision.score.boundsSound = decision.score.boundsSound && allOtherBoundsSound;
       decision.score.certified = decision.exactValueCertified;
     }
     decision.metrics.rootWorkers = rootParallel ? 2 : 1;
@@ -1863,12 +1897,16 @@ extern "C" {
         ExactDecision fresh = planner.evaluateRootAction(data->state, optionIndex);
         if (first) { accumulated = fresh; first = false; }
         else {
+          const bool boundsSound = accumulated.score.boundsSound && fresh.score.boundsSound;
+          const bool valueCertified = accumulated.score.certified && fresh.score.certified;
           if (ExactCompare(fresh.score.lower, accumulated.score.lower) > 0)
             accumulated.score.lower = fresh.score.lower;
           if (ExactCompare(fresh.score.upper, accumulated.score.upper) < 0)
             accumulated.score.upper = fresh.score.upper;
           accumulated.score.action = { optionIndex };
-          accumulated.score.certified = ExactCompare(accumulated.score.lower, accumulated.score.upper) == 0;
+          accumulated.score.boundsSound = boundsSound;
+          accumulated.score.certified = valueCertified
+            && ExactCompare(accumulated.score.lower, accumulated.score.upper) == 0;
           accumulated.rootActions = fresh.rootActions;
           accumulated.metrics = fresh.metrics;
         }
@@ -1876,8 +1914,9 @@ extern "C" {
       }
       if (first) accumulated = planner.evaluateRootAction(data->state, optionIndex);
       accumulated.bestActionCertified = false;
-      accumulated.actionValueCertified = accumulated.score.certified;
-      accumulated.exactValueCertified = accumulated.score.certified;
+      accumulated.actionValueCertified = ExactMetricsCanCertify(accumulated.metrics)
+        && accumulated.score.boundsSound && accumulated.score.certified;
+      accumulated.exactValueCertified = false;
       return ExactDecisionJson(data, accumulated);
     } catch (...) {
       data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":99}");

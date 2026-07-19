@@ -529,6 +529,10 @@ struct ExactScore {
 	ExactFraction upper = ExactFraction::integer(100'000'000);
 	ExactSmallAction action;
 	bool certified = false;
+	// The interval is mathematically sound even when it is still wide.  A
+	// provisional opponent policy must never produce a point interval here;
+	// it is widened to the global range before it reaches pruning or TT code.
+	bool boundsSound = true;
 };
 
 struct ExactRootActionValue {
@@ -914,6 +918,15 @@ struct ExactMetrics {
 	ExactSkeleton::CertScope certificationScope = ExactSkeleton::CertScope::ExactEvaluatorExpectation;
 };
 
+inline bool ExactMetricsCanCertify(const ExactMetrics& metrics) {
+	return metrics.informationSetSafe
+		&& metrics.probabilityExact
+		&& !metrics.arithmeticOverflow
+		&& !metrics.hiddenInformationLeakDetected
+		&& metrics.provisionalOpponentPolicyNodes == 0
+		&& !metrics.v4PassiveDrawExperimental;
+}
+
 struct ExactDecision {
 	ExactScore score;
 	ExactMetrics metrics;
@@ -1097,7 +1110,7 @@ public:
 		// Identity-oracle gates (tests/test_v4_identity_oracle.py) cover Moment Passive
 		// Passive integral mass on the artificial no-Ultra-Ball deck; keep experimental
 		// until that suite stays green in CI, then certify.
-		v4PassiveDrawCertified = true;
+		v4PassiveDrawCertified = false;
 #ifdef _WIN32
 		{
 			char passiveDraw[8]{};
@@ -1112,7 +1125,9 @@ public:
 			v4PassiveDrawEnabled = true;
 #endif
 		v4StripPassiveOnly = false;
-		if (v4PassiveDrawEnabled && !v4PassiveDrawCertified) metrics.v4PassiveDrawExperimental = true;
+		if ((v4PassiveDrawEnabled || (evaluator && evaluator->usesV4Search()))
+			&& !v4PassiveDrawCertified)
+			metrics.v4PassiveDrawExperimental = true;
 		ExactEnsureDeferredFunctionRegistry();
 		if (runtimeMode != ExactRuntimeMode::Legacy) {
 			metrics.runtimeVersion = 3;
@@ -1177,10 +1192,12 @@ public:
 		ExactDecision result;
 		result.score = solveOwned(cloneState(root));
 		result.rootActions = rootActionValues;
-		result.bestActionCertified = (!result.score.action.empty()
+		const bool certifiable = ExactMetricsCanCertify(metrics);
+		result.bestActionCertified = certifiable && result.score.boundsSound
+			&& (!result.score.action.empty()
 			&& (root.options.size() <= 1 || result.score.certified));
-		result.actionValueCertified = result.score.certified;
-		result.exactValueCertified = result.score.certified;
+		result.actionValueCertified = certifiable && result.score.boundsSound && result.score.certified;
+		result.exactValueCertified = result.bestActionCertified && result.actionValueCertified;
 		applyEvaluatorSafety(result);
 		metrics.workerBusyNs += (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
 			std::chrono::steady_clock::now() - workerStarted).count();
@@ -1222,9 +1239,10 @@ public:
 				? revealAndReplay(root, child.exact, { optionIndex }) : solveOwned(cloneState(child));
 			result.score.action = { optionIndex };
 		}
-		result.actionValueCertified = result.score.certified;
+		result.actionValueCertified = ExactMetricsCanCertify(metrics)
+			&& result.score.boundsSound && result.score.certified;
 		result.bestActionCertified = false;
-		result.exactValueCertified = result.score.certified;
+		result.exactValueCertified = false;
 		applyEvaluatorSafety(result);
 		metrics.workerBusyNs += (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
 			std::chrono::steady_clock::now() - workerStarted).count();
@@ -1304,6 +1322,12 @@ public:
 		}
 		std::vector<int> remapped;
 		if (!remapAction(observed, selected->actionTokens, remapped)) { metrics.policyMisses++; return false; }
+		if (!ExactMetricsCanCertify(metrics) || !selected->score.boundsSound) {
+			// A policy may have been computed before a later worker discovered a
+			// certification blocker.  Re-rooting must not resurrect that entry.
+			metrics.policyMisses++;
+			return false;
+		}
 		result.score = selected->score;
 		result.score.action = std::move(remapped);
 		result.actionValueCertified = selected->actionValueCertified;
@@ -1648,7 +1672,7 @@ private:
 	bool reverseActionOrder = false;
 	bool skeletonSharingEnabled = false;
 	bool v4PassiveDrawEnabled = false;
-	bool v4PassiveDrawCertified = true; // Moment Passive + identity oracle gates
+	bool v4PassiveDrawCertified = false; // Moment Passive + identity oracle gates
 	bool v4StripPassiveOnly = false;
 	ExactPassivePayloadV4 chanceNodeBasePassive;
 	bool concreteWorldCaching = false;
@@ -2688,8 +2712,17 @@ private:
 		bool exactValueCertified, unsigned long long subtreeExpanded) {
 		if (score.action.empty() && state.selectMin != 0) return;
 		if (policy.size() >= MaxPolicyEntries || policyBytes >= MaxPolicyBytes) return;
+		// Policy entries are a re-rooting fast path.  Never persist a point value
+		// or certification bit that was produced before the global safety gates
+		// (including provisional opponent policy and experimental V4) ran.
+		const bool certifiable = ExactMetricsCanCertify(metrics) && score.boundsSound;
+		ExactScore storedScore = score;
+		storedScore.certified = storedScore.certified && certifiable;
+		actionValueCertified = actionValueCertified && certifiable;
+		bestActionCertified = bestActionCertified && certifiable;
+		exactValueCertified = exactValueCertified && certifiable;
 		std::string key = observationKeyFor(state);
-		ExactPolicyEntry entry{ score, semanticAction(state, score.action),
+		ExactPolicyEntry entry{ storedScore, semanticAction(state, score.action),
 			actionValueCertified, bestActionCertified, exactValueCertified,
 			subtreeExpanded };
 		size_t bytes = key.size() + sizeof(ExactPolicyEntry) + 64;
@@ -2960,9 +2993,27 @@ private:
 			decision.exactValueCertified = false;
 			for (ExactRootActionValue& action : decision.rootActions) action.certified = false;
 		}
+		if (!ExactMetricsCanCertify(metrics)) {
+			decision.score.certified = false;
+			decision.actionValueCertified = false;
+			decision.bestActionCertified = false;
+			decision.exactValueCertified = false;
+			for (ExactRootActionValue& action : decision.rootActions) action.certified = false;
+		}
 	}
 
 	ExactScore unknown() const { return {}; }
+
+	ExactScore boundaryScore(const State& state, long long value) {
+		if (state.exact.provisionalOpponentPolicy) {
+			// A deterministic opponent choice is an estimate, not a minimax
+			// boundary.  Keep all downstream intervals sound by discarding the
+			// point estimate before it can enter pruning or a transposition table.
+			metrics.provisionalOpponentPolicyNodes++;
+			return unknown();
+		}
+		return { ExactFraction::integer(value), ExactFraction::integer(value), {}, true, true };
+	}
 
 	struct SemanticOptionId {
 		std::array<int, 7> values{};
@@ -3431,6 +3482,7 @@ private:
 		ExactWeight totalWeight = chooseCount(totalHidden, handSize), processedWeight;
 		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
 		unsigned long long handWorlds = 0;
+		bool boundsSound = true;
 		// A root worker normally yields after 20k nodes.  Yielding before one
 		// information set has considered every legal discard would restart that
 		// minimisation and can never make progress.  Complete a bounded chunk while
@@ -3483,6 +3535,7 @@ private:
 				}
 				if (!foundAction || ExactCompare(score.lower, handLower) < 0) handLower = score.lower;
 				if (!foundAction || ExactCompare(score.upper, handUpper) < 0) handUpper = score.upper;
+				boundsSound = boundsSound && score.boundsSound;
 				foundAction = true;
 			}
 			if (!foundAction || expired()) break;
@@ -3499,8 +3552,8 @@ private:
 		}
 		metrics.rawOutcomes += handWorlds;
 		metrics.groupedOutcomes += discardScores.size();
-		bool certified = remaining.zero() && ExactCompare(lower, upper) == 0;
-		return { lower, upper, {}, certified };
+		bool certified = boundsSound && remaining.zero() && ExactCompare(lower, upper) == 0;
+		return { lower, upper, {}, certified, boundsSound };
 	}
 
 	bool expandRevealBelief(const State& parent, const ExactHiddenState& request,
@@ -3763,7 +3816,7 @@ private:
 			metrics.chanceMassMismatches++; metrics.probabilityExact = false; return unknown();
 		}
 		ExactScore result{ partial.completedLower, partial.completedUpper, {},
-			ExactCompare(partial.completedLower, partial.completedUpper) == 0 };
+			ExactCompare(partial.completedLower, partial.completedUpper) == 0, true };
 		partialBytes -= std::min(partialBytes, partial.accountedBytes);
 		partialPartitionReveals.erase(revealKey);
 		return result;
@@ -3951,16 +4004,19 @@ private:
 		if (scores.empty() || total.zero()) return unknown();
 		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
 		bool certified = true;
+		bool boundsSound = true;
 		ExactWeight processed;
 		for (const auto& item : scores) {
 			lower = ExactFraction::add(lower, item.first.lower.scaled(item.second, total));
 			upper = ExactFraction::add(upper, item.first.upper.scaled(item.second, total));
-			processed += item.second; certified = certified && item.first.certified;
+			processed += item.second;
+			certified = certified && item.first.certified;
+			boundsSound = boundsSound && item.first.boundsSound;
 		}
 		if (processed != total) {
 			metrics.chanceMassMismatches++; metrics.probabilityExact = false; return unknown();
 		}
-		return { lower, upper, {}, certified && ExactCompare(lower, upper) == 0 };
+		return { lower, upper, {}, certified && boundsSound && ExactCompare(lower, upper) == 0, boundsSound };
 	}
 
 	bool settleBeliefState(State& state) {
@@ -4021,6 +4077,12 @@ private:
 		const bool maximize = decisionPlayer == actor;
 		ExactScore best;
 		bool first = true;
+		bool allBoundsSound = true;
+		ExactFraction decisionLower = ExactFraction::integer(maximize ? -100'000'000 : 100'000'000);
+		ExactFraction decisionUpper = ExactFraction::integer(maximize ? -100'000'000 : 100'000'000);
+		std::vector<ExactScore> candidateScores;
+		candidateScores.reserve(actions.size());
+		size_t bestIndex = 0;
 		for (const CommonAction& common : actions) {
 			if (expired()) return unknown();
 			std::vector<BeliefWorld> children;
@@ -4040,10 +4102,48 @@ private:
 				} else children.push_back({ std::move(child), world.weight, world.knowledge });
 			}
 			ExactScore score = solveBelief(std::move(children));
+			candidateScores.push_back(score);
+			allBoundsSound = allBoundsSound && score.boundsSound;
+			if (maximize) {
+				if (first || ExactCompare(score.lower, decisionLower) > 0) decisionLower = score.lower;
+				if (first || ExactCompare(score.upper, decisionUpper) > 0) decisionUpper = score.upper;
+			} else {
+				if (first || ExactCompare(score.lower, decisionLower) < 0) decisionLower = score.lower;
+				if (first || ExactCompare(score.upper, decisionUpper) < 0) decisionUpper = score.upper;
+			}
 			if (first || (maximize ? ExactCompare(score.lower, best.lower) > 0
 				: ExactCompare(score.upper, best.upper) < 0)) {
-				best = score; best.action = common.representative; first = false;
+				best = score; best.action = common.representative; bestIndex = candidateScores.size() - 1; first = false;
 			}
+		}
+		// A selected action's exact value is not enough to certify an
+		// information-set decision.  Every alternative must have sound bounds
+		// that cannot beat it; otherwise keep the decision resumable.
+		bool haveOther = false;
+		ExactFraction bestOtherUpper;
+		ExactFraction bestOtherLower;
+		if (!first) {
+			for (size_t index = 0; index < candidateScores.size(); ++index) {
+				if (index == bestIndex) continue;
+				const ExactScore& score = candidateScores[index];
+				if (!haveOther) {
+					bestOtherUpper = score.upper;
+					bestOtherLower = score.lower;
+					haveOther = true;
+				} else if (maximize) {
+					if (ExactCompare(score.upper, bestOtherUpper) > 0) bestOtherUpper = score.upper;
+				} else if (ExactCompare(score.lower, bestOtherLower) < 0) bestOtherLower = score.lower;
+			}
+		}
+		if (!first) {
+			const bool selectedProven = maximize
+				? (!haveOther || ExactCompare(best.lower, bestOtherUpper) >= 0)
+				: (!haveOther || ExactCompare(best.upper, bestOtherLower) <= 0);
+			best.lower = decisionLower;
+			best.upper = decisionUpper;
+			best.certified = best.certified && allBoundsSound && selectedProven
+				&& ExactCompare(best.lower, best.upper) == 0;
+			best.boundsSound = allBoundsSound;
 		}
 		return best;
 	}
@@ -4111,7 +4211,11 @@ private:
 				long long value;
 				if (cached != evaluationCache.end()) { value = cached->second; metrics.evaluatorCacheHits++; }
 				else { value = evaluateBeliefInformationState(item.second, mass); evaluationCache.emplace(std::move(cacheKey), value); }
-				scores.push_back({ { ExactFraction::integer(value), ExactFraction::integer(value), {}, policyCertified }, mass });
+					ExactScore leaf = policyCertified
+						? ExactScore{ ExactFraction::integer(value), ExactFraction::integer(value), {}, true, true }
+						: unknown();
+					if (!policyCertified) metrics.provisionalOpponentPolicyNodes++;
+					scores.push_back({ leaf, mass });
 				metrics.leaves++;
 			}
 			return finish(aggregateBeliefScores(scores, total));
@@ -4544,8 +4648,7 @@ private:
 
 		if (node.kind == ExactSkeleton::NodeKind::Leaf) {
 			if (!(state.isFinish() || IsExactTurnLeaf(state))) { dag.walkFailed = true; return unknown(); }
-			auto value = ExactFraction::integer(evaluate(state));
-			return { value, value, {}, !state.exact.provisionalOpponentPolicy };
+			return boundaryScore(state, evaluate(state));
 		}
 
 		if (node.kind == ExactSkeleton::NodeKind::SolveBridge) {
@@ -4571,6 +4674,7 @@ private:
 			if (!coinNode && types.empty()) { dag.walkFailed = true; return unknown(); }
 			ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
 			bool certified = true;
+			bool boundsSound = true;
 			ExactWeight total;
 			struct Branch { ExactWeight weight; ExactScore score; };
 			std::vector<Branch> branches;
@@ -4610,6 +4714,7 @@ private:
 				branches.push_back({ weight, child });
 				total += weight;
 				certified = certified && child.certified;
+				boundsSound = boundsSound && child.boundsSound;
 			}
 			if (total.zero()) { dag.walkFailed = true; return unknown(); }
 			for (const Branch& branch : branches) {
@@ -4617,7 +4722,7 @@ private:
 				upper = ExactFraction::add(upper, branch.score.upper.scaled(branch.weight, total));
 				if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; dag.walkFailed = true; return unknown(); }
 			}
-			return { lower, upper, {}, certified && ExactCompare(lower, upper) == 0 };
+			return { lower, upper, {}, certified && boundsSound && ExactCompare(lower, upper) == 0, boundsSound };
 		}
 
 		std::vector<std::pair<std::string, ExactSmallAction>> legal;
@@ -4639,6 +4744,7 @@ private:
 		ExactScore best;
 		bool first = true;
 		bool allCertified = true;
+		bool allBoundsSound = true;
 		const bool maximize = node.kind == ExactSkeleton::NodeKind::DecisionMax;
 		for (const ExactSkeleton::DagEdge& edge : node.edges) {
 			auto found = std::find_if(legal.begin(), legal.end(),
@@ -4649,6 +4755,7 @@ private:
 			ExactScore childScore = walkSkeletonNode(dag, edge.child, std::move(child), depthLimit - 1);
 			if (dag.walkFailed) return unknown();
 			allCertified = allCertified && childScore.certified;
+			allBoundsSound = allBoundsSound && childScore.boundsSound;
 			if (first || (maximize ? ExactCompare(childScore.lower, best.lower) > 0
 				: ExactCompare(childScore.upper, best.upper) < 0)) {
 				best = childScore;
@@ -4656,7 +4763,8 @@ private:
 			}
 		}
 		if (first) { dag.walkFailed = true; return unknown(); }
-		best.certified = allCertified && ExactCompare(best.lower, best.upper) == 0;
+		best.certified = allCertified && allBoundsSound && ExactCompare(best.lower, best.upper) == 0;
+		best.boundsSound = allBoundsSound;
 		return best;
 	}
 
@@ -4692,6 +4800,7 @@ private:
 		}
 		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
 		bool certified = true;
+		bool boundsSound = true;
 		for (size_t member : members) {
 			if (expired()) return unknown();
 			ExactStatePtr child;
@@ -4722,8 +4831,9 @@ private:
 			upper = ExactFraction::add(upper, score.upper.scaled(outcomes[member].weight, totalMass));
 			if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return unknown(); }
 			certified = certified && score.certified;
+			boundsSound = boundsSound && score.boundsSound;
 		}
-		return { lower, upper, {}, certified && ExactCompare(lower, upper) == 0 };
+		return { lower, upper, {}, certified && boundsSound && ExactCompare(lower, upper) == 0, boundsSound };
 	}
 
 	struct DrawContinuationClass {
@@ -5626,7 +5736,7 @@ private:
 			metrics.chanceMassMismatches++; metrics.probabilityExact = false; return unknown();
 		}
 		ExactScore result{ partial.completedLower, partial.completedUpper, {},
-			ExactCompare(partial.completedLower, partial.completedUpper) == 0 };
+			ExactCompare(partial.completedLower, partial.completedUpper) == 0, true };
 		partialBytes -= std::min(partialBytes, partial.accountedBytes);
 		partialMultiDraws.erase(resumeKey);
 		return result;
@@ -5648,6 +5758,7 @@ private:
 		noteWeight(total);
 		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
 		bool certified = true;
+		bool boundsSound = true;
 		ExactWeight processed;
 		for (const auto& item : types) {
 			int id = item.first; const ExactWeight& weight = item.second;
@@ -5682,9 +5793,10 @@ private:
 			processed += weight;
 			if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return unknown(); }
 			certified = certified && score.certified;
+			boundsSound = boundsSound && score.boundsSound;
 		}
 		if (processed != total) { metrics.chanceMassMismatches++; metrics.probabilityExact = false; return unknown(); }
-		return { lower, upper, {}, certified && ExactCompare(lower, upper) == 0 };
+		return { lower, upper, {}, certified && boundsSound && ExactCompare(lower, upper) == 0, boundsSound };
 	}
 
 	ExactScore coinChance(const State& state, const std::string& nodeKey) {
@@ -5703,6 +5815,7 @@ private:
 		}
 		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
 		bool certified = true;
+		bool boundsSound = true;
 		for (CoinOutcome& outcome : outcomes) {
 			if (expired()) { metrics.partialChanceNodes++; return unknown(); }
 			ExactScore score = solveOwned(std::move(outcome.state));
@@ -5710,8 +5823,9 @@ private:
 			upper = ExactFraction::add(upper, score.upper.scaled(outcome.weight, ExactWeight(2)));
 			if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return unknown(); }
 			certified = certified && score.certified;
+			boundsSound = boundsSound && score.boundsSound;
 		}
-		return { lower, upper, {}, certified && ExactCompare(lower, upper) == 0 };
+		return { lower, upper, {}, certified && boundsSound && ExactCompare(lower, upper) == 0, boundsSound };
 	}
 
 	ExactScore decision(const State& state, bool maximize, const std::string& nodeKey) {
@@ -5721,6 +5835,7 @@ private:
 		bool selectedActionValueCertified = false;
 		ExactFraction aggregate = maximize ? ExactFraction::integer(-100'000'000) : ExactFraction::integer(100'000'000);
 		bool allCertified = true;
+		bool allBoundsSound = true;
 		struct SuccessorScoreEntry {
 			std::string key;
 			ExactScore score;
@@ -5752,13 +5867,15 @@ private:
 				if (maximize) { if (ExactCompare(score.upper, aggregate) > 0) aggregate = score.upper; }
 				else { if (ExactCompare(score.lower, aggregate) < 0) aggregate = score.lower; }
 				allCertified = allCertified && score.certified;
+				allBoundsSound = allBoundsSound && score.boundsSound;
 				if (first || (maximize ? ExactCompare(score.lower, result.lower) > 0 : ExactCompare(score.upper, result.upper) < 0)) {
 					result = score; result.action = action;
 					selectedActionValueCertified = score.certified;
 					first = false;
 				}
 				if (recursionDepth == 1)
-					rootActionValues.push_back({ action, score.lower, score.upper, score.certified });
+					rootActionValues.push_back({ action, score.lower, score.upper,
+						score.certified && score.boundsSound });
 				return true;
 			}
 			std::string transitionKey;
@@ -5837,20 +5954,24 @@ private:
 				} else {
 					if (ExactCompare(score.lower, found->second.lower) > 0) found->second.lower = score.lower;
 					if (ExactCompare(score.upper, found->second.upper) < 0) found->second.upper = score.upper;
-					found->second.certified = ExactCompare(found->second.lower, found->second.upper) == 0;
+					found->second.certified = found->second.certified && score.certified
+						&& ExactCompare(found->second.lower, found->second.upper) == 0;
+					found->second.boundsSound = found->second.boundsSound && score.boundsSound;
 					score = found->second;
 					metrics.resumedActionCount++;
 				}
 				partial->resumeOrdinal = thisOrdinal + 1;
 			}
 			if (recursionDepth == 1)
-				rootActionValues.push_back({ action, score.lower, score.upper, score.certified });
+				rootActionValues.push_back({ action, score.lower, score.upper,
+					score.certified && score.boundsSound });
 			if (maximize) {
 				if (ExactCompare(score.upper, aggregate) > 0) aggregate = score.upper;
 			} else {
 				if (ExactCompare(score.lower, aggregate) < 0) aggregate = score.lower;
 			}
 			allCertified = allCertified && score.certified;
+			allBoundsSound = allBoundsSound && score.boundsSound;
 			if (first || (maximize ? ExactCompare(score.lower, result.lower) > 0 : ExactCompare(score.upper, result.upper) < 0)) {
 				result = score; result.action = action;
 				selectedActionValueCertified = score.certified;
@@ -5864,6 +5985,7 @@ private:
 			if (maximize) result.upper = ExactFraction::integer(100'000'000);
 			else result.lower = ExactFraction::integer(-100'000'000);
 			result.certified = false;
+			result.boundsSound = allBoundsSound;
 			metrics.partialDecisionNodes++;
 			if (!singletonRevealStreaming) rememberPolicy(state, result,
 				selectedActionValueCertified, false, false,
@@ -5871,7 +5993,8 @@ private:
 			return result;
 		}
 		if (maximize) result.upper = aggregate; else result.lower = aggregate;
-		result.certified = allCertified && ExactCompare(result.lower, result.upper) == 0;
+		result.certified = allCertified && allBoundsSound && ExactCompare(result.lower, result.upper) == 0;
+		result.boundsSound = allBoundsSound;
 		if (!singletonRevealStreaming) rememberPolicy(state, result,
 			selectedActionValueCertified, result.certified, result.certified,
 			metrics.expanded - expandedBefore);
@@ -5931,8 +6054,7 @@ private:
 		// node could be completed.
 		if (state.isFinish() || IsExactTurnLeaf(state)) {
 			metrics.leaves++;
-			auto value = ExactFraction::integer(evaluate(state));
-			return { value, value, {}, !state.exact.provisionalOpponentPolicy };
+			return boundaryScore(state, evaluate(state));
 		}
 		// A search has made this concrete world a singleton information set, but
 		// Main states still contain many commuting action orders.  The

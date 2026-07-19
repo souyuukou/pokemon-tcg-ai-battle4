@@ -74,4 +74,4 @@ jobs:
       - name: Run native regression tests against freshly built DLL
         shell: pwsh
         run: |
-          python -m unittest sample_submission.tests.test_exact_native sample_submission.tests.test_worst_case_fixture
+          python -m unittest sample_submission.tests.test_exact_native sample_submission.tests.test_worst_case_fixture sample_submission.tests.test_v4_identity_oracle
