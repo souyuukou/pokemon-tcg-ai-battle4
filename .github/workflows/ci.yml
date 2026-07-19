@@ -55,3 +55,8 @@ jobs:
         shell: pwsh
         run: |
           msbuild "ptcg_engine/ptcgProgram 22/game.sln" /m:2 /p:Configuration=Release /p:Platform=x64
+          Copy-Item "ptcg_engine/ptcgProgram 22/x64/Release/cg.dll" "sample_submission/sample_submission/cg/cg.dll" -Force
+      - name: Run native regression tests against freshly built DLL
+        shell: pwsh
+        run: |
+          python -m unittest sample_submission.tests.test_exact_native sample_submission.tests.test_worst_case_fixture

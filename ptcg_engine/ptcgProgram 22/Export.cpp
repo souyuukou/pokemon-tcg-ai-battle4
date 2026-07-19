@@ -596,6 +596,7 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
   j.appendCommaKey("upperNumerator"); AppendExactNumerator(j, decision.score.upper);
   j.appendCommaKey("upperDenominator"); AppendExactDenominator(j, decision.score.upper);
   j.appendCommaKeyValue("certified", decision.score.certified);
+  j.appendCommaKeyValue("actionValueCertified", decision.actionValueCertified);
   j.appendCommaKeyValue("bestActionCertified", decision.bestActionCertified);
   j.appendCommaKeyValue("exactValueCertified", decision.exactValueCertified);
   j.appendCommaKey("certificationScope");
@@ -1047,6 +1048,7 @@ struct ExactTurnSession {
     bool claimed = false;
     bool blocked = false;
     bool eliminated = false;
+    bool hasBeenVisited = false;
     int lastWorker = -1;
   };
 
@@ -1107,7 +1109,7 @@ struct ExactTurnSession {
       std::lock_guard<std::mutex> lock(mutex);
       if (index < 0 || index >= (int)tasks.size()) return;
       RootTask& task = *tasks[index];
-      if (task.score.action.empty()) task.score = fresh;
+      if (!task.hasBeenVisited) task.score = fresh;
       else {
         if (ExactCompare(fresh.lower, task.score.lower) > 0) task.score.lower = fresh.lower;
         if (ExactCompare(fresh.upper, task.score.upper) < 0) task.score.upper = fresh.upper;
@@ -1117,6 +1119,8 @@ struct ExactTurnSession {
       }
       task.intervalWidth = remainingWidth(task.score);
       task.consumedNodes += consumedNodes;
+      task.score.action = { task.option };
+      task.hasBeenVisited = true;
       task.claimed = false;
       task.blocked = task.blocked || blocked;
       pruneDominatedLocked();
@@ -1126,14 +1130,14 @@ struct ExactTurnSession {
       int best = -1;
       for (int i = 0; i < (int)tasks.size(); ++i) {
         const auto& item = tasks[i];
-        if (item->score.action.empty() || item->blocked || item->eliminated) continue;
+        if (item->blocked || item->eliminated) continue;
         if (best < 0 || ExactCompare(item->score.lower, tasks[best]->score.lower) > 0)
           best = i;
       }
       if (best < 0) return;
       const ExactFraction bestLower = tasks[best]->score.lower;
       for (auto& item : tasks) {
-        if (item->claimed || item->blocked || item->eliminated || item->score.action.empty()) continue;
+        if (item->claimed || item->blocked || item->eliminated) continue;
         if (ExactCompare(item->score.upper, bestLower) < 0) {
           item->eliminated = true;
           ++eliminations;
@@ -1299,7 +1303,9 @@ struct ExactTurnSession {
         return output;
       };
 	  auto rootLease0 = ExactGlobalThreadBudget().acquire();
-	  auto rootLease1 = ExactGlobalThreadBudget().tryLease();
+	  ExactThreadBudget::Lease rootLease1;
+	  const size_t assignedCount = workerAssignments[0].size() + workerAssignments[1].size();
+	  if (assignedCount > 1) rootLease1 = ExactGlobalThreadBudget().tryLease();
       if (rootLease1) {
 	        auto future0 = std::async(std::launch::async, run, 0);
 	        auto future1 = std::async(std::launch::async, run, 1);
@@ -1376,8 +1382,10 @@ struct ExactTurnSession {
 				hasOtherUpper = true;
 			}
 		}
-		decision.bestActionCertified = !hasOtherUpper
-			|| ExactCompare(decision.score.lower, maxOtherUpper) >= 0;
+		decision.bestActionCertified = decision.metrics.informationSetSafe
+			&& (!hasOtherUpper || ExactCompare(decision.score.lower, maxOtherUpper) >= 0);
+		decision.actionValueCertified = decision.metrics.informationSetSafe
+			&& ExactCompare(decision.score.lower, decision.score.upper) == 0;
 		decision.exactValueCertified = decision.bestActionCertified
 			&& ExactCompare(decision.score.lower, decision.score.upper) == 0;
 		decision.score.upper = maxUpper;
@@ -1450,8 +1458,9 @@ struct ExactTurnSession {
 	// the first permit while blocking for a second would deadlock two concurrent
 	// sessions, each of which already owns one permit.
 	auto rootLease0 = ExactGlobalThreadBudget().acquire();
-	auto rootLease1 = ExactGlobalThreadBudget().tryLease();
-	const bool rootParallel = queue.tasks.size() > 1 && (bool)rootLease1;
+	ExactThreadBudget::Lease rootLease1;
+	if (queue.tasks.size() > 1) rootLease1 = ExactGlobalThreadBudget().tryLease();
+	const bool rootParallel = static_cast<bool>(rootLease1);
 	for (const auto& task : queue.tasks)
 		task->planner->setThreadPermitHeld(true);
 	for (const auto& task : queue.tasks)
@@ -1488,6 +1497,8 @@ struct ExactTurnSession {
     if (future1.valid()) future1.get();
 	for (const auto& task : queue.tasks)
 		if (task->planner) task->planner->setThreadPermitHeld(false);
+	for (const auto& task : queue.tasks)
+		MergeExactMetrics(decision.metrics, task->planner->currentMetrics());
 
     int selectedIndex = -1, alternateIndex = -1;
     bool first = true;
@@ -1496,7 +1507,7 @@ struct ExactTurnSession {
       int index = -1;
       for (int i = 0; i < (int)queue.tasks.size(); ++i)
         if (queue.tasks[i]->option == option) { index = i; break; }
-      if (index < 0 || queue.tasks[index]->score.action.empty()) continue;
+      if (index < 0) continue;
       ExactScore item = queue.tasks[index]->score; item.action = { option };
       decision.rootActions.push_back({ item.action, item.lower, item.upper, item.certified });
       if (queue.tasks[index]->eliminated) continue;
@@ -1512,7 +1523,7 @@ struct ExactTurnSession {
       int repIndex = -1;
       for (int i = 0; i < (int)queue.tasks.size(); ++i)
         if (queue.tasks[i]->option == representative[option]) { repIndex = i; break; }
-      if (repIndex < 0 || queue.tasks[repIndex]->score.action.empty()) continue;
+      if (repIndex < 0) continue;
       ExactScore alias = queue.tasks[repIndex]->score; alias.action = { option };
       decision.rootActions.push_back({ alias.action, alias.lower, alias.upper, alias.certified });
       decision.metrics.successorMerges++;
@@ -1522,21 +1533,24 @@ struct ExactTurnSession {
       ExactFraction maxOtherUpper;
       bool hasOtherUpper = false;
       for (const auto& task : queue.tasks) {
-        if (task->eliminated || task->score.action.empty() || task->option == queue.tasks[selectedIndex]->option)
+        if (task->eliminated || task->option == queue.tasks[selectedIndex]->option)
           continue;
         if (!hasOtherUpper || ExactCompare(task->score.upper, maxOtherUpper) > 0) {
           maxOtherUpper = task->score.upper;
           hasOtherUpper = true;
         }
       }
-      decision.bestActionCertified = !hasOtherUpper
-        || ExactCompare(decision.score.lower, maxOtherUpper) >= 0;
+      decision.bestActionCertified = decision.metrics.informationSetSafe
+        && queue.tasks[selectedIndex]->hasBeenVisited
+        && (!hasOtherUpper
+          || ExactCompare(decision.score.lower, maxOtherUpper) >= 0);
+      decision.actionValueCertified = decision.metrics.informationSetSafe
+        && ExactCompare(decision.score.lower, decision.score.upper) == 0;
       decision.exactValueCertified = decision.bestActionCertified
         && ExactCompare(decision.score.lower, decision.score.upper) == 0;
       if (!decision.bestActionCertified) decision.score.upper = maxUpper;
       decision.score.certified = decision.exactValueCertified;
     }
-    for (const auto& task : queue.tasks) MergeExactMetrics(decision.metrics, task->planner->currentMetrics());
     decision.metrics.rootWorkers = rootParallel ? 2 : 1;
     decision.metrics.rootQueueLeases += queue.leases;
     decision.metrics.rootQueueReassignments += queue.reassignments;
@@ -1842,7 +1856,8 @@ extern "C" {
         if (accumulated.score.certified || planner.resourceStopped()) break;
       }
       if (first) accumulated = planner.evaluateRootAction(data->state, optionIndex);
-      accumulated.bestActionCertified = accumulated.score.certified;
+      accumulated.bestActionCertified = false;
+      accumulated.actionValueCertified = accumulated.score.certified;
       accumulated.exactValueCertified = accumulated.score.certified;
       return ExactDecisionJson(data, accumulated);
     } catch (...) {

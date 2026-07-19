@@ -112,7 +112,7 @@ inline void ExactEnsureDeferredFunctionRegistry() {
 	static std::once_flag registryOnce;
 	std::call_once(registryOnce, [] {
 		auto reg = [](void* fp, DeferredArgSemantics semantics = {
-			DeferredArgSemantic::Scalar, DeferredArgSemantic::Scalar, DeferredArgSemantic::Scalar }) {
+			DeferredArgSemantic::Unknown, DeferredArgSemantic::Unknown, DeferredArgSemantic::Unknown }) {
 			auto found = FunctionIndexTable.find((long long)fp);
 			if (found == FunctionIndexTable.end()) {
 				throw std::runtime_error("deferred function is missing from FunctionIndexTable");
@@ -133,7 +133,8 @@ inline void ExactEnsureDeferredFunctionRegistry() {
 		reg((void*)SeparatorProc);
 		// Attach / trigger pipeline (Enriching Energy attaches via temporaryTriggerStack).
 		reg((void*)AfterAbility);
-		reg((void*)AfterTriggerAbility);
+		reg((void*)AfterTriggerAbility,
+			{ DeferredArgSemantic::Scalar, DeferredArgSemantic::None, DeferredArgSemantic::None });
 		reg((void*)ResolveTriggerStack,
 			{ DeferredArgSemantic::Scalar, DeferredArgSemantic::None, DeferredArgSemantic::None });
 		reg((void*)AfterPlay);
@@ -917,6 +918,7 @@ struct ExactDecision {
 	ExactScore score;
 	ExactMetrics metrics;
 	std::vector<ExactRootActionValue> rootActions;
+	bool actionValueCertified = false;
 	bool bestActionCertified = false;
 	bool exactValueCertified = false;
 };
@@ -1175,10 +1177,11 @@ public:
 		ExactDecision result;
 		result.score = solveOwned(cloneState(root));
 		result.rootActions = rootActionValues;
-		applyEvaluatorSafety(result);
 		result.bestActionCertified = (!result.score.action.empty()
 			&& (root.options.size() <= 1 || result.score.certified));
+		result.actionValueCertified = result.score.certified;
 		result.exactValueCertified = result.score.certified;
+		applyEvaluatorSafety(result);
 		metrics.workerBusyNs += (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
 			std::chrono::steady_clock::now() - workerStarted).count();
 		result.metrics = metrics;
@@ -1219,9 +1222,10 @@ public:
 				? revealAndReplay(root, child.exact, { optionIndex }) : solveOwned(cloneState(child));
 			result.score.action = { optionIndex };
 		}
-		applyEvaluatorSafety(result);
-		result.bestActionCertified = result.score.certified;
+		result.actionValueCertified = result.score.certified;
+		result.bestActionCertified = false;
 		result.exactValueCertified = result.score.certified;
+		applyEvaluatorSafety(result);
 		metrics.workerBusyNs += (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
 			std::chrono::steady_clock::now() - workerStarted).count();
 		result.metrics = metrics;
@@ -1300,6 +1304,7 @@ public:
 		result.score = selected->score;
 		result.score.action = std::move(remapped);
 		result.bestActionCertified = result.score.certified;
+		result.actionValueCertified = result.score.certified;
 		result.exactValueCertified = result.score.certified;
 		metrics.policyHits++;
 		metrics.rerootCount++;
@@ -2927,6 +2932,9 @@ private:
 		if (!evaluator || !evaluator->isLoaded() || !supportedSchema || !evaluator->informationSetSafe()) {
 			metrics.informationSetSafe = false;
 			decision.score.certified = false;
+			decision.actionValueCertified = false;
+			decision.bestActionCertified = false;
+			decision.exactValueCertified = false;
 			for (ExactRootActionValue& action : decision.rootActions) action.certified = false;
 		}
 		// Keep V4 / Passive-draw experimental until the identity-oracle certification flag.
@@ -2934,6 +2942,9 @@ private:
 			&& ((evaluator && evaluator->usesV4Search()) || v4PassiveDrawEnabled)) {
 			metrics.v4PassiveDrawExperimental = true;
 			decision.score.certified = false;
+			decision.actionValueCertified = false;
+			decision.bestActionCertified = false;
+			decision.exactValueCertified = false;
 			for (ExactRootActionValue& action : decision.rootActions) action.certified = false;
 		}
 	}

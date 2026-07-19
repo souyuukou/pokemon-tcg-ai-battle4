@@ -57,6 +57,12 @@ class NativeExactSmokeTest(unittest.TestCase):
                                            [100] * len(profile.cards), 100)
                     self.assertGreaterEqual(int(one_shot["rootQueueLeases"]), 1)
                     self.assertLessEqual(int(one_shot["maxConcurrentSearchThreads"]), 2)
+                    if len(obs_after.select.option) > 1:
+                        # A deliberately tiny slice may leave root tasks
+                        # untouched; that must never certify an action.
+                        tiny = exact_decide(obs_after, list(profile.cards),
+                                            [100] * len(profile.cards), 1)
+                        self.assertFalse(tiny["bestActionCertified"])
                     break
                 if obs_after.current.turn > 0:
                     # Consume the other side's decision without inspecting its
