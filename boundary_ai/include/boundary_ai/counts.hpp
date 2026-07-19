@@ -86,11 +86,11 @@ public:
 private:
     std::vector<CountEntry> entries_;
 
-    auto lowerBound(CardTypeId card) {
+    std::vector<CountEntry>::iterator lowerBound(CardTypeId card) {
         return std::lower_bound(entries_.begin(), entries_.end(), card,
             [](const CountEntry& entry, CardTypeId id) { return entry.card < id; });
     }
-    auto lowerBound(CardTypeId card) const {
+    std::vector<CountEntry>::const_iterator lowerBound(CardTypeId card) const {
         return std::lower_bound(entries_.begin(), entries_.end(), card,
             [](const CountEntry& entry, CardTypeId id) { return entry.card < id; });
     }
