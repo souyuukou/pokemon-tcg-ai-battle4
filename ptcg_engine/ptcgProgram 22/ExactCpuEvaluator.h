@@ -79,6 +79,16 @@ public:
 		loaded = true;
 		return true;
 	}
+	// The general evaluator deliberately accepts only an information-set-safe
+	// V3 model whose manifest says it was trained on intermediate states.  It is
+	// never substituted for the boundary evaluator used by exact search.
+	bool loadGeneral(const std::string& path, std::string& error) {
+		if (!sparseV3.load(path, error, false)) return false;
+		version = ExactEvaluatorVersion::V3;
+		fallbackToV3 = true;
+		loaded = true;
+		return true;
+	}
 	bool isLoaded() const { return loaded; }
 	const std::string& path() const { return sparseV3.path(); }
 	int schemaVersion() const {

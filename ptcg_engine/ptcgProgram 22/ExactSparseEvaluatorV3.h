@@ -130,7 +130,7 @@ public:
 		int prizes = 0;
 	};
 
-	bool load(const std::string& path, std::string& error) {
+	bool load(const std::string& path, std::string& error, bool requireBoundaryOnly = true) {
 		loaded = false; manifestSafe = false; modelHashValue = 0;
 		std::ifstream stream(path, std::ios::binary | std::ios::ate);
 		if (!stream) { error = "cannot open evaluator model"; return false; }
@@ -169,7 +169,7 @@ public:
 		if (raw.size() != expected && !hasManifest) { error = "invalid evaluator V3 payload length"; return false; }
 		if (!hasManifest) { error = "evaluator V3 manifest is missing"; return false; }
 		std::memcpy(&manifest, raw.data() + expected, sizeof(manifest));
-		if (!ExactEvaluatorManifestMatches(manifest, SchemaVersion)) {
+		if (!ExactEvaluatorManifestMatches(manifest, SchemaVersion, requireBoundaryOnly)) {
 			error = "evaluator V3 manifest mismatch"; return false;
 		}
 		manifestSafe = true;

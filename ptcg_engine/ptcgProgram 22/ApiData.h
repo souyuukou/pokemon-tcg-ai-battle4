@@ -26,7 +26,10 @@ public:
 	BinaryReader reader;
 	std::vector<std::u8string> visData;
 	std::shared_ptr<ExactCpuEvaluator> exactEvaluator;
+	std::shared_ptr<ExactCpuEvaluator> generalEvaluator;
 	bool exactReplayTraceEnabled = false;
+	int exactReplayTraceMode = 0; // 1: turn boundaries, 2: all decision states
 	int exactReplayLastTurn = -1;
 	std::vector<std::pair<State, int>> exactReplayTurnLeaves;
+	std::vector<std::pair<State, int>> exactReplayDecisionStates;
 };

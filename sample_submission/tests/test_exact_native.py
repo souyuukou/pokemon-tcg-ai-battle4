@@ -10,7 +10,10 @@ sys.path.insert(0, ROOT)
 
 from cg.api import (
     exact_decide,
+    exact_estimate_root,
+    exact_general_decide,
     exact_load_evaluator_model,
+    exact_load_general_evaluator_model,
     exact_turn_advance,
     exact_turn_begin,
     exact_turn_progress,
@@ -24,6 +27,45 @@ import main
 
 
 class NativeExactSmokeTest(unittest.TestCase):
+    def test_general_model_is_separate_and_scores_one_step_actions(self) -> None:
+        profile = load_profile()
+        deck = list(profile.cards)
+        model = Path(ROOT, "general-evaluator-v3.bin").resolve()
+        boundary_model = Path(ROOT, "exact-evaluator-v3.bin").resolve()
+        with self.assertRaises(RuntimeError):
+            exact_load_general_evaluator_model(str(boundary_model))
+        with self.assertRaises(RuntimeError):
+            exact_load_evaluator_model(str(model))
+        loaded = exact_load_general_evaluator_model(str(model))
+        self.assertTrue(loaded["informationSetSafe"])
+        self.assertFalse(loaded["boundaryOnly"])
+        raw, start = battle_start_seeded(deck, deck, 17)
+        self.assertEqual(-1, start.errorPlayer, start.errorType)
+        try:
+            for _ in range(96):
+                obs = to_observation_class(raw)
+                if (obs.current.turn > 0
+                        and agent_policy._turn_owner(obs.current)
+                        == obs.current.yourIndex):
+                    estimate = exact_estimate_root(obs, deck, [100] * 60)
+                    self.assertEqual(len(obs.select.option),
+                                     len(estimate["optionWork"]))
+                    decision = exact_general_decide(obs, deck, [100] * 60, 1000)
+                    self.assertEqual("general_one_step_value",
+                                     decision["decisionMode"])
+                    self.assertTrue(decision["informationSetSafe"])
+                    self.assertFalse(decision["certified"])
+                    self.assertGreater(decision["evaluatedActions"], 0)
+                    self.assertGreaterEqual(
+                        len(decision["selected"]), obs.select.minCount)
+                    self.assertLessEqual(
+                        len(decision["selected"]), obs.select.maxCount)
+                    return
+                raw = battle_select(list(range(obs.select.minCount)))
+            self.fail("did not reach an own-turn general-evaluator state")
+        finally:
+            battle_finish()
+
     def test_same_root_resume_retains_every_competing_action(self) -> None:
         profile = load_profile()
         deck = list(profile.cards)
@@ -103,8 +145,21 @@ class NativeExactSmokeTest(unittest.TestCase):
                     self.assertTrue(all(0 <= i < len(obs_after.select.option) for i in native_action))
                     self.assertIsNotNone(agent_policy.last_decision)
                     self.assertTrue(agent_policy.last_decision["informationSetSafe"])
-                    self.assertFalse(agent_policy.last_decision["hiddenInformationLeakDetected"])
-                    self.assertGreater(agent_policy.last_decision["expandedNodes"], 0)
+                    if agent_policy.last_decision.get("decisionMode") == "general_one_step_value":
+                        self.assertFalse(agent_policy.last_decision["certified"])
+                        self.assertGreater(
+                            agent_policy.last_decision["evaluatedActions"], 0)
+                        exact_diagnostic = agent_policy.last_decision.get("exactSearch")
+                        if exact_diagnostic is not None:
+                            self.assertFalse(
+                                exact_diagnostic["hiddenInformationLeakDetected"])
+                            self.assertGreater(
+                                exact_diagnostic["expandedNodes"], 0)
+                    else:
+                        self.assertFalse(
+                            agent_policy.last_decision["hiddenInformationLeakDetected"])
+                        self.assertGreater(
+                            agent_policy.last_decision["expandedNodes"], 0)
                     if agent_policy._default_context.session_id is not None:
                         progress = exact_turn_progress(agent_policy._default_context.session_id)
                         for key in ("actionValueCertified", "bestActionCertified",

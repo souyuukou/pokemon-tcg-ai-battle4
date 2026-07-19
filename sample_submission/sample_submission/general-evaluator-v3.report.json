@@ -1,0 +1,135 @@
+{
+  "dataset": "D:\\pokemon-tcg-ai-battle4\\data\\train-v3-both.jsonl",
+  "datasetSha256": "197dd4207a704dc08803e02319fcfabb658799b4724e144fddcfe38b44da7bb4",
+  "initialModel": "D:\\pokemon-tcg-ai-battle4\\data\\exact-evaluator-v3-retrained.bin",
+  "output": "D:\\pokemon-tcg-ai-battle4\\data\\general-evaluator-v3-trained.bin",
+  "boundaryOnly": false,
+  "informationSetSafe": true,
+  "device": "cuda",
+  "epochs": 20,
+  "bestEpoch": 2,
+  "examples": 46999,
+  "splitExamples": {
+    "train": 36454,
+    "validation": 4815,
+    "test": 5730
+  },
+  "validationHistory": [
+    {
+      "epoch": 1,
+      "mse": 1.0048105511355143,
+      "signAccuracy": 0.6947040498442367
+    },
+    {
+      "epoch": 2,
+      "mse": 0.94345363549885,
+      "signAccuracy": 0.6963655244029076
+    },
+    {
+      "epoch": 3,
+      "mse": 1.017045096626345,
+      "signAccuracy": 0.6843198338525441
+    },
+    {
+      "epoch": 4,
+      "mse": 1.1140624312069285,
+      "signAccuracy": 0.6652128764278297
+    },
+    {
+      "epoch": 5,
+      "mse": 1.1286858717919548,
+      "signAccuracy": 0.6716510903426791
+    },
+    {
+      "epoch": 6,
+      "mse": 1.0943324864137385,
+      "signAccuracy": 0.6627206645898235
+    },
+    {
+      "epoch": 7,
+      "mse": 1.087626824718519,
+      "signAccuracy": 0.6753894080996885
+    },
+    {
+      "epoch": 8,
+      "mse": 1.0278725363042078,
+      "signAccuracy": 0.6697819314641744
+    },
+    {
+      "epoch": 9,
+      "mse": 1.1164406647440743,
+      "signAccuracy": 0.6411214953271028
+    },
+    {
+      "epoch": 10,
+      "mse": 1.151044801715683,
+      "signAccuracy": 0.6529595015576324
+    },
+    {
+      "epoch": 11,
+      "mse": 1.1427656415127772,
+      "signAccuracy": 0.6404984423676012
+    },
+    {
+      "epoch": 12,
+      "mse": 1.2458574205183914,
+      "signAccuracy": 0.6440290758047768
+    },
+    {
+      "epoch": 13,
+      "mse": 1.1066028720275636,
+      "signAccuracy": 0.652128764278297
+    },
+    {
+      "epoch": 14,
+      "mse": 1.1269663692518548,
+      "signAccuracy": 0.6377985462097612
+    },
+    {
+      "epoch": 15,
+      "mse": 1.1952470587489745,
+      "signAccuracy": 0.6529595015576324
+    },
+    {
+      "epoch": 16,
+      "mse": 1.1652030611404607,
+      "signAccuracy": 0.6373831775700934
+    },
+    {
+      "epoch": 17,
+      "mse": 1.2132979259142203,
+      "signAccuracy": 0.6384215991692627
+    },
+    {
+      "epoch": 18,
+      "mse": 1.194723628653054,
+      "signAccuracy": 0.6311526479750779
+    },
+    {
+      "epoch": 19,
+      "mse": 1.177357241839764,
+      "signAccuracy": 0.6431983385254413
+    },
+    {
+      "epoch": 20,
+      "mse": 1.1757561204542177,
+      "signAccuracy": 0.6492211838006231
+    }
+  ],
+  "floatTest": {
+    "mse": 1.0665601086616516,
+    "signAccuracy": 0.6214659685863875
+  },
+  "quantizedTest": {
+    "mse": 0.8115713480831641,
+    "signAccuracy": 0.6469458987783595
+  },
+  "initialModelTest": {
+    "mse": 0.9089560902314622,
+    "signAccuracy": 0.643280977312391
+  },
+  "improvesInitialMse": true,
+  "zeroBaselineMse": 1.0,
+  "modelSha256": "838600d3a966597b00036c16f96724ed479aa6019a3bc9e22c20ed9764fd7598",
+  "modelBytes": 30437184
+}

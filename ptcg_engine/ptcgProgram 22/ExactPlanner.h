@@ -984,6 +984,21 @@ struct ExactDecision {
 	bool exactValueCertified = false;
 };
 
+struct ExactGeneralActionValue {
+	std::vector<int> action;
+	long long value = 0;
+};
+
+struct ExactGeneralDecision {
+	std::vector<int> selected;
+	std::vector<ExactGeneralActionValue> actions;
+	unsigned long long estimatedWork = 0;
+	unsigned long long evaluatedActions = 0;
+	bool candidateSetComplete = true;
+	bool informationSetSafe = false;
+	bool modelLoaded = false;
+};
+
 // Search states are short-lived and are created at almost every explored edge.
 // Keep their vector capacities alive in a worker-local pool so exact search does
 // not pay the allocator cost for every mathematically distinct successor.
@@ -1371,6 +1386,59 @@ public:
 			*workEstimate = estimate;
 		}
 		return keyFor(root);
+	}
+
+	// Apply each semantic root action exactly once, then score the resulting
+	// intermediate information state with the separately trained general
+	// evaluator.  This is an explicitly approximate exception policy: it never
+	// enters the exact TT and it never claims boundary-value certification.
+	ExactGeneralDecision evaluateGeneralRoot(State root,
+		unsigned long long maximumCandidates = 4096) {
+		auto threadLease = threadPermitHeld ? ExactThreadBudget::Lease()
+			: ExactGlobalThreadBudget().acquire();
+		ExactGeneralDecision result;
+		result.modelLoaded = evaluator && evaluator->isLoaded();
+		result.informationSetSafe = result.modelLoaded
+			&& evaluator->informationSetSafe() && !evaluator->boundaryOnly();
+		if (!result.informationSetSafe) return result;
+		Game exactGame;
+		prepareExactRoot(root, exactGame);
+		actor = root.selectPlayer;
+		initializeHidden(root);
+		root.game->config.manualCoin = true;
+		root.exact.enabled = true;
+		root.exact.actor = (signed char)actor;
+		long long bestValue = std::numeric_limits<long long>::min();
+		std::vector<int> bestAction;
+		bool hasBest = false;
+		bool completed = forEachLegalAction(root, [&](const ExactSmallAction& action) {
+			if (result.evaluatedActions >= maximumCandidates) {
+				result.candidateSetComplete = false;
+				return false;
+			}
+			State child = root;
+			if (!advance(child, action)) return true;
+			const long long value = evaluateGeneralState(child);
+			std::vector<int> physical = action;
+			result.actions.push_back({ physical, value });
+			result.evaluatedActions++;
+			if (!hasBest || value > bestValue
+				|| (value == bestValue && physical < bestAction)) {
+				bestValue = value;
+				bestAction = std::move(physical);
+				hasBest = true;
+			}
+			return true;
+		});
+		result.candidateSetComplete = result.candidateSetComplete && completed;
+		result.informationSetSafe = result.informationSetSafe
+			&& metrics.informationSetSafe;
+		result.selected = std::move(bestAction);
+		if (!hasBest && root.options.size() >= (size_t)root.selectMin) {
+			for (int i = 0; i < root.selectMin; ++i) result.selected.push_back(i);
+			result.candidateSetComplete = false;
+		}
+		return result;
 	}
 
 	// Re-root a completed turn policy at the currently observed decision.  The
@@ -2939,6 +3007,63 @@ private:
 			return result;
 		}
 		return 0;
+	}
+
+	long long evaluateGeneralState(const State& state) {
+		if (state.isFinish()) {
+			const int winner = state.winPlayer();
+			return winner == actor ? 100'000'000
+				: (winner == 2 ? 0 : -100'000'000);
+		}
+		if (!evaluator || !evaluator->isLoaded() || evaluator->boundaryOnly()) return 0;
+		auto features = ExactSparseEvaluatorV3::extractFeatures(
+			state, actor, &actorProfileCount);
+		// Exact hooks pause before a hidden draw/prize identity is materialized.
+		// Project that immediate random result into the expected V3 feature
+		// vector.  Only public profile counts and the current belief projection
+		// are used; no physical hidden CardRef is inspected.
+		auto projectExpectedTransfer = [&](int sourceRelation, int sourceDense,
+			int sourceSize, int count) {
+			if (sourceSize <= 0 || count <= 0) return;
+			count = std::min(count, sourceSize);
+			const int originalCount = features.globalSparse.count;
+			for (int i = 0; i < originalCount; ++i) {
+				auto& item = features.globalSparse.values[i];
+				if (item.relation != sourceRelation || item.value <= 0) continue;
+				const long long movedNumerator = (long long)item.value * count;
+				const int moved = (int)((movedNumerator + sourceSize / 2) / sourceSize);
+				if (moved > 0 && !features.globalSparse.push(item.token,
+					ExactSparseEvaluatorV3::OwnHand, moved)) {
+					features.overflow = true;
+					break;
+				}
+				item.value -= moved;
+			}
+			if (sourceDense >= 0)
+				features.globalDense[sourceDense] =
+					std::max(0, features.globalDense[sourceDense] - count);
+		};
+		if (state.exact.pendingPlayer == actor) {
+			if (state.exact.pending == ExactPendingType::Draw)
+				projectExpectedTransfer(ExactSparseEvaluatorV3::OwnDeckExpected,
+					5, (int)state.players[actor].deck.size(), state.exact.pendingCount);
+			else if (state.exact.pending == ExactPendingType::TakePrize)
+				projectExpectedTransfer(ExactSparseEvaluatorV3::OwnPrizeExpected,
+					3, (int)state.players[actor].prize.size(), state.exact.pendingCount);
+		} else if (state.exact.pendingPlayer == 1 - actor
+			&& state.exact.pending == ExactPendingType::Draw) {
+			const int count = std::min((int)state.exact.pendingCount,
+				(int)state.players[1 - actor].deck.size());
+			features.globalDense[6] = std::max(0, features.globalDense[6] - count);
+			features.globalDense[7] += count;
+		}
+		features.globalSparse.canonicalize();
+		long long value = 0;
+		if (features.overflow || !evaluator->evaluateV3Features(features, value)) {
+			metrics.informationSetSafe = false;
+			return 0;
+		}
+		return value;
 	}
 
 	static int beliefQ8(const ExactWeight& numerator, const ExactWeight& denominator) {

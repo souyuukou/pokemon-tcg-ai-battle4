@@ -117,11 +117,28 @@ if hasattr(lib, "ExactTurnProgress"):
     lib.ExactTurnProgress.restype = ctypes.c_char_p
     lib.ExactTurnProgress.argtypes = [ctypes.c_void_p, ctypes.c_int64]
 
+if hasattr(lib, "ExactEstimateRoot"):
+    lib.ExactEstimateRoot.restype = ctypes.c_char_p
+    lib.ExactEstimateRoot.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+        ctypes.c_int, ctypes.c_uint64]
+if hasattr(lib, "ExactGeneralDecide"):
+    lib.ExactGeneralDecide.restype = ctypes.c_char_p
+    lib.ExactGeneralDecide.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint64]
 if hasattr(lib, "ExactLoadEvaluatorModel"):
     lib.ExactLoadEvaluatorModel.restype = ctypes.c_char_p
     lib.ExactLoadEvaluatorModel.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 if hasattr(lib, "ExactUnloadEvaluatorModel"):
     lib.ExactUnloadEvaluatorModel.argtypes = [ctypes.c_void_p]
+if hasattr(lib, "ExactLoadGeneralEvaluatorModel"):
+    lib.ExactLoadGeneralEvaluatorModel.restype = ctypes.c_char_p
+    lib.ExactLoadGeneralEvaluatorModel.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+if hasattr(lib, "ExactUnloadGeneralEvaluatorModel"):
+    lib.ExactUnloadGeneralEvaluatorModel.argtypes = [ctypes.c_void_p]
 if hasattr(lib, "ExactArithmeticDiagnostics"):
     lib.ExactArithmeticDiagnostics.restype = ctypes.c_char_p
 if hasattr(lib, "ExactEvaluatorTokensV3"):
@@ -147,6 +164,12 @@ if hasattr(lib, "ExactEvaluateFeaturesV3"):
 if hasattr(lib, "ExactReplayTraceBegin"):
     lib.ExactReplayTraceBegin.restype = ctypes.c_int
     lib.ExactReplayTraceBegin.argtypes = [ctypes.c_void_p]
+if hasattr(lib, "ExactReplayIntermediateTraceBegin"):
+    lib.ExactReplayIntermediateTraceBegin.restype = ctypes.c_int
+    lib.ExactReplayIntermediateTraceBegin.argtypes = [ctypes.c_void_p]
+if hasattr(lib, "ExactReplayDualTraceBegin"):
+    lib.ExactReplayDualTraceBegin.restype = ctypes.c_int
+    lib.ExactReplayDualTraceBegin.argtypes = [ctypes.c_void_p]
 if hasattr(lib, "ExactReplaySetDeckOrder"):
     lib.ExactReplaySetDeckOrder.restype = ctypes.c_int
     lib.ExactReplaySetDeckOrder.argtypes = [ctypes.c_void_p, ctypes.c_int,
@@ -156,6 +179,13 @@ if hasattr(lib, "ExactReplaySetHiddenZones"):
     lib.ExactReplaySetHiddenZones.argtypes = [ctypes.c_void_p, ctypes.c_int,
                                                ctypes.POINTER(ctypes.c_int), ctypes.c_int,
                                                ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+if hasattr(lib, "ExactReplaySetAllHiddenZones"):
+    lib.ExactReplaySetAllHiddenZones.restype = ctypes.c_int
+    lib.ExactReplaySetAllHiddenZones.argtypes = [
+        ctypes.c_void_p, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int]
 if hasattr(lib, "ExactReplayTraceDrain"):
     lib.ExactReplayTraceDrain.restype = ctypes.c_char_p
     lib.ExactReplayTraceDrain.argtypes = [ctypes.c_void_p]

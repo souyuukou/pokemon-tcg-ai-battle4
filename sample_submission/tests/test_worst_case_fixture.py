@@ -54,8 +54,9 @@ class WorstCaseFixtureTest(unittest.TestCase):
                     action = main.agent(raw)
                     decision = agent_policy.last_decision
                     self.assertTrue(action)
-                    if int(decision.get("streamingCursorGenerated", 0)) > 0:
-                        streaming_decision = decision
+                    exact_diagnostic = decision.get("exactSearch", decision)
+                    if int(exact_diagnostic.get("streamingCursorGenerated", 0)) > 0:
+                        streaming_decision = exact_diagnostic
                         break
             self.assertIsNotNone(decision)
             self.assertIsNotNone(streaming_decision, "rich fixture never reached streaming draw path")

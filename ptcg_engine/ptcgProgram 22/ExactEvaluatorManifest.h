@@ -31,12 +31,12 @@ inline constexpr std::uint64_t ExactFeatureSchemaHash = 0xb694f079709a9522ULL;
 inline constexpr std::uint64_t ExactBeliefSchemaHash = 0xa30c8939b0a5dbb2ULL;
 
 inline bool ExactEvaluatorManifestMatches(const ExactEvaluatorManifestDisk& manifest,
-	std::uint32_t schemaVersion) {
+	std::uint32_t schemaVersion, bool boundaryOnly = true) {
 	return std::memcmp(manifest.magic, ExactEvaluatorManifestMagic, sizeof(manifest.magic)) == 0
 		&& manifest.version == ExactEvaluatorManifestVersion
 		&& manifest.schemaVersion == schemaVersion
 		&& manifest.featureSchemaHash == ExactFeatureSchemaHash
 		&& manifest.beliefSchemaHash == ExactBeliefSchemaHash
 		&& manifest.informationSetSafe != 0
-		&& manifest.boundaryOnly != 0;
+		&& (manifest.boundaryOnly != 0) == boundaryOnly;
 }

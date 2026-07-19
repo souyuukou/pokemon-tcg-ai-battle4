@@ -14,6 +14,7 @@ _last_turn = None
 last_decision = None
 _policy_cache = {}
 _evaluator_loaded = False
+_general_evaluator_loaded = False
 _fallback_cards = None
 
 
@@ -38,6 +39,82 @@ def _ensure_v3_evaluator() -> None:
         raise RuntimeError("V3 evaluator model was not accepted")
     _evaluator_loaded = True
 
+def _ensure_general_evaluator() -> None:
+    global _general_evaluator_loaded
+    if _general_evaluator_loaded:
+        return
+    from pathlib import Path
+    from cg.api import exact_load_general_evaluator_model
+    from .nnue_v3 import BELIEF_SCHEMA_HASH, FEATURE_SCHEMA_HASH
+    candidates = [
+        Path(__file__).resolve().parents[1] / "general-evaluator-v3.bin",
+        Path("/kaggle_simulations/agent/general-evaluator-v3.bin"),
+    ]
+    path = next((candidate for candidate in candidates if candidate.exists()), None)
+    if path is None:
+        raise RuntimeError("general evaluator model is missing")
+    info = exact_load_general_evaluator_model(str(path))
+    if (int(info.get("schemaVersion", 0)) != 3
+            or not info.get("informationSetSafe")
+            or info.get("boundaryOnly")
+            or int(info.get("featureSchemaHash", 0)) != FEATURE_SCHEMA_HASH
+            or int(info.get("beliefSchemaHash", 0)) != BELIEF_SCHEMA_HASH):
+        raise RuntimeError("general evaluator model was not accepted")
+    _general_evaluator_loaded = True
+
+
+def _profile_inputs():
+    profile = load_profile()
+    values = profile.evaluator.get("hand_values", {})
+    hand_values = [
+        int(values.get(str(card_id), values.get("default", 100)))
+        for card_id in profile.cards
+    ]
+    return profile, hand_values
+
+
+def _general_action(obs, *, budget_milliseconds: int = 1500) -> tuple[list[int], dict]:
+    from cg.api import exact_general_decide
+    _ensure_general_evaluator()
+    profile, hand_values = _profile_inputs()
+    decision = exact_general_decide(
+        obs, list(profile.cards), hand_values,
+        max(1, budget_milliseconds),
+        int(os.environ.get("PTCG_GENERAL_MAX_CANDIDATES", "4096")),
+    )
+    # Outcome Value is intentionally broad and can miss a locally forcing
+    # sequence (attack now, take a mandatory beneficial search target, avoid a
+    # self-KO Ability). Blend the already observation-safe tactical scorer into
+    # the candidate ranking instead of falling back to it only after failure.
+    # The network remains the long-horizon term and breaks tactical ties.
+    blend = int(os.environ.get("PTCG_GENERAL_TACTICAL_BLEND", "250000"))
+    ranked = []
+    for candidate in decision.get("actions", ()):
+        physical = [int(index) for index in candidate.get("selected", ())]
+        tactical = sum(
+            max(-10_000.0, min(10_000.0, _fallback_score(
+                obs, obs.select.option[index])))
+            for index in physical
+        )
+        combined = int(candidate.get("value", 0)) + int(round(blend * tactical))
+        ranked.append((-combined, tuple(physical), physical,
+                       int(candidate.get("value", 0)), tactical))
+    if ranked:
+        selected = min(ranked)
+        decision["selected"] = selected[2]
+        decision["networkValue"] = selected[3]
+        decision["tacticalValue"] = selected[4]
+        decision["combinedValue"] = -selected[0]
+        decision["tacticalBlend"] = blend
+    action = [int(index) for index in decision.get("selected", ())]
+    select = obs.select
+    if (not select.minCount <= len(action) <= select.maxCount
+            or len(action) != len(set(action))
+            or any(index < 0 or index >= len(select.option) for index in action)
+            or not decision.get("informationSetSafe")):
+        raise RuntimeError("general evaluator returned an invalid action")
+    return action, decision
+
 
 @dataclass
 class PolicyContext:
@@ -48,6 +125,7 @@ class PolicyContext:
     last_decision: dict | None = None
     budget_turn: int | None = None
     turn_search_seconds: float = 0.0
+    general_turn: int | None = None
 
     def reset(self) -> None:
         if self.session_id is not None:
@@ -62,6 +140,7 @@ class PolicyContext:
         self.last_decision = None
         self.budget_turn = None
         self.turn_search_seconds = 0.0
+        self.general_turn = None
 
 
 _default_context = PolicyContext(_budget)
@@ -328,6 +407,7 @@ def choose_action(obs, *, context: PolicyContext | None = None,
     hidden chance variables. The bundled API demands guessed opponent cards, so
     this policy never calls it with fabricated identities.
     """
+    global _last_turn, last_decision
     ctx = context or _default_context
     observed_turn = obs.current.turn if obs.current is not None else None
     if observed_turn != ctx.budget_turn:
@@ -364,25 +444,64 @@ def choose_action(obs, *, context: PolicyContext | None = None,
                 exact_turn_release(ctx.session_id)
             except (RuntimeError, OSError):
                 pass
-            ctx.session_id = None
+        ctx.session_id = None
         ctx.last_turn = None
-        return finish(_fallback_action(obs), False,
-                      "heuristic-opponent-turn-selection")
+        try:
+            action, general = _general_action(obs, budget_milliseconds=1000)
+            ctx.last_decision = general
+            return finish(action, False, "general-opponent-turn-selection")
+        except Exception as error:
+            return finish(_fallback_action(obs), False,
+                          f"fail-closed-opponent-policy: {type(error).__name__}: {error}")
     if select.minCount == select.maxCount == 0: return finish([], True, "forced-empty")
     if select.minCount == select.maxCount == option_count:
         return finish(list(range(option_count)), True, "forced-all")
-    global _last_turn, last_decision
+    if ctx.general_turn == observed_turn:
+        try:
+            action, general = _general_action(obs, budget_milliseconds=1500)
+            ctx.last_decision = general
+            if context is None:
+                last_decision = general
+            return finish(action, False, "general-explosion-turn-continuation")
+        except Exception:
+            # Continue into exact/fail-closed handling if the optional model has
+            # become unavailable; never fabricate a general result.
+            ctx.general_turn = None
     native_failure = "native exact chance provider unavailable"
     try:
         if not ctx.budget.can_expand():
             raise RuntimeError("exact search resource reserve reached")
-        from cg.api import exact_decide, exact_turn_begin, exact_turn_advance, exact_turn_release
+        from cg.api import (
+            exact_decide,
+            exact_estimate_root,
+            exact_turn_begin,
+            exact_turn_advance,
+            exact_turn_release,
+        )
         _ensure_v3_evaluator()
-        profile = load_profile()
-        values = profile.evaluator.get("hand_values", {})
-        hand_values = [int(values.get(str(card_id), values.get("default", 100))) for card_id in profile.cards]
+        _ensure_general_evaluator()
+        profile, hand_values = _profile_inputs()
         is_new_turn = obs.current is not None and obs.current.turn != ctx.last_turn
         usable_ms = max(1, int((ctx.budget.remaining - ctx.budget.limits.reserve_seconds) * 1000))
+        if is_new_turn:
+            estimate = exact_estimate_root(
+                obs, list(profile.cards), hand_values,
+                int(os.environ.get("PTCG_EXACT_WORK_THRESHOLD", "500000")),
+            )
+            if bool(estimate.get("recommendedGeneral", False)):
+                if ctx.session_id is not None:
+                    exact_turn_release(ctx.session_id)
+                    ctx.session_id = None
+                action, general = _general_action(
+                    obs, budget_milliseconds=min(2000, usable_ms))
+                general["rootEstimate"] = estimate
+                ctx.last_turn = obs.current.turn
+                ctx.general_turn = obs.current.turn
+                ctx.last_decision = general
+                if context is None:
+                    _last_turn = ctx.last_turn
+                    last_decision = general
+                return finish(action, False, "general-predicted-explosion")
         requested_ms = _turn_slice_milliseconds(
             ctx, is_new_turn, usable_ms,
             allow_reroot=ctx.session_id is not None and not is_new_turn,
@@ -443,15 +562,41 @@ def choose_action(obs, *, context: PolicyContext | None = None,
                 _last_turn = ctx.last_turn
                 last_decision = native
             if not bool(native.get("exactValueCertified", native.get("certified", False))):
-                reason = "native-exact-budget-exhausted"
-            # At a hard resource ceiling, return the exact solver's documented
-            # highest-lower-bound action and interval. Never replace an
-            # information-set-safe native result with the emergency heuristic.
+                # Exact intervals remain diagnostic evidence, but when their
+                # argmax is still open at the hard time ceiling the dedicated
+                # intermediate-state model is the intended exception policy.
+                try:
+                    general_action, general = _general_action(
+                        obs, budget_milliseconds=min(1500, max(1, usable_ms)))
+                    general["exactSearch"] = native
+                    if ctx.session_id is not None:
+                        exact_turn_release(ctx.session_id)
+                        ctx.session_id = None
+                    ctx.last_decision = general
+                    ctx.general_turn = observed_turn
+                    if context is None:
+                        last_decision = general
+                    return finish(general_action, False,
+                                  "general-exact-time-exhausted")
+                except Exception:
+                    reason = "native-exact-budget-exhausted"
+            # If the general model itself is unavailable, preserve the exact
+            # solver's documented highest-lower-bound action and interval.
             return finish(action, bool(native.get("exactValueCertified",
                                                    native.get("certified", False))),
                           reason)
     except Exception as error:
         native_failure = f"{type(error).__name__}: {error}"
+    try:
+        action, general = _general_action(obs, budget_milliseconds=1000)
+        ctx.last_decision = general
+        if context is None:
+            last_decision = general
+        return finish(action, False,
+                      f"general-fail-closed-exact: {native_failure}")
+    except Exception as general_error:
+        native_failure += (
+            f"; general={type(general_error).__name__}: {general_error}")
     # O(n log n), including variable-cardinality selections.  Enumerating every
     # combination here used to make the emergency path itself exceed the clock
     # on large search lists.

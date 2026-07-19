@@ -75,6 +75,44 @@ extern "C" GAME_API void ExactUnloadEvaluatorModel(ApiData* data) {
   if (data != nullptr) data->exactEvaluator.reset();
 }
 
+extern "C" GAME_API const char8_t* ExactLoadGeneralEvaluatorModel(ApiData* data,
+	const char* path) {
+	if (data == nullptr) {
+		static thread_local const char8_t kInvalidApiData[] =
+			u8"{\"loaded\":false,\"error\":\"invalid ApiData\"}";
+		return kInvalidApiData;
+	}
+	if (path == nullptr || path[0] == '\0')
+		return ExactErrorJson(data, 400, "general evaluator path is null or empty");
+	JsonBuilder& j = data->jsonBuilder;
+	j.clear(); j.append('{');
+	std::string error;
+	auto evaluator = std::make_shared<ExactCpuEvaluator>();
+	const bool loaded = evaluator->loadGeneral(path, error);
+	if (loaded) data->generalEvaluator = std::move(evaluator);
+	const ExactCpuEvaluator* accepted = loaded ? data->generalEvaluator.get() : nullptr;
+	j.appendKeyValue("loaded", loaded);
+	j.appendCommaKeyValue("schemaVersion", accepted ? accepted->schemaVersion() : 0);
+	j.appendCommaKeyValue("informationSetSafe",
+		accepted != nullptr && accepted->informationSetSafe());
+	j.appendCommaKeyValue("boundaryOnly",
+		accepted != nullptr && accepted->boundaryOnly());
+	j.appendCommaKey("featureSchemaHash"); AppendUnsignedLongLong(j, ExactFeatureSchemaHash);
+	j.appendCommaKey("beliefSchemaHash"); AppendUnsignedLongLong(j, ExactBeliefSchemaHash);
+	j.appendCommaKey("modelHash"); AppendUnsignedLongLong(j,
+		accepted ? accepted->modelHash() : 0);
+	j.appendCommaKey("residentBytes"); AppendUnsignedLongLong(j,
+		accepted ? accepted->residentBytes() : 0);
+	j.appendCommaKey("error");
+	j.appendDoubleQuote(std::u8string((const char8_t*)error.c_str(), error.size()));
+	j.append('}');
+	return j.buf.c_str();
+}
+
+extern "C" GAME_API void ExactUnloadGeneralEvaluatorModel(ApiData* data) {
+	if (data != nullptr) data->generalEvaluator.reset();
+}
+
 extern "C" GAME_API const char8_t* ExactArithmeticDiagnostics() {
   static thread_local JsonBuilder j; j.clear();
   ExactWeight a(50'063'860ULL), b(321'387'366'339'585ULL);
@@ -428,7 +466,16 @@ extern "C" GAME_API long long ExactEvaluateFeaturesV3(ApiData* data,
 extern "C" GAME_API int ExactReplayTraceBegin(ApiData* data) {
   if (data == nullptr || data->apiDataType != 1) return 30;
   data->exactReplayTurnLeaves.clear(); data->exactReplayLastTurn = -1;
+  data->exactReplayDecisionStates.clear(); data->exactReplayTraceMode = 1;
   data->exactReplayTraceEnabled = true; data->game.config.pauseAtExactTurnLeaf = true; return 0;
+}
+
+extern "C" GAME_API int ExactReplayIntermediateTraceBegin(ApiData* data) {
+  if (data == nullptr || data->apiDataType != 1) return 30;
+  data->exactReplayTurnLeaves.clear(); data->exactReplayDecisionStates.clear();
+  data->exactReplayLastTurn = -1; data->exactReplayTraceMode = 2;
+  data->exactReplayTraceEnabled = true; data->game.config.pauseAtExactTurnLeaf = false;
+  return 0;
 }
 
 extern "C" GAME_API int ExactReplaySetDeckOrder(ApiData* data, int playerIndex,
@@ -494,19 +541,87 @@ extern "C" GAME_API int ExactReplaySetHiddenZones(ApiData* data, int playerIndex
   return 0;
 }
 
+extern "C" GAME_API int ExactReplayDualTraceBegin(ApiData* data) {
+  if (data == nullptr || data->apiDataType != 1) return 30;
+  data->exactReplayTurnLeaves.clear(); data->exactReplayDecisionStates.clear();
+  data->exactReplayLastTurn = -1; data->exactReplayTraceMode = 3;
+  data->exactReplayTraceEnabled = true; data->game.config.pauseAtExactTurnLeaf = true;
+  return 0;
+}
+
+extern "C" GAME_API int ExactReplaySetAllHiddenZones(ApiData* data, int playerIndex,
+  const int* handIds, int handCount, const int* deckIds, int deckCount,
+  const int* prizeIds, int prizeCount) {
+  if (data == nullptr || data->apiDataType != 1) return 30;
+  if (playerIndex < 0 || playerIndex >= 2 || handCount < 0 || deckCount < 0
+    || prizeCount < 0 || (handCount > 0 && handIds == nullptr)
+    || (deckCount > 0 && deckIds == nullptr)
+    || (prizeCount > 0 && prizeIds == nullptr)) return 1;
+  PlayerState& player = data->state.players[playerIndex];
+  if (player.hand.size() + player.deck.size() + player.prize.size()
+      != handCount + deckCount + prizeCount) return 2;
+  CardList remaining = player.hand;
+  for (CardRef ref : player.deck) remaining.push_back(ref);
+  for (CardRef ref : player.prize) remaining.push_back(ref);
+  std::unordered_map<int, int> actualCounts, requestedCounts;
+  for (CardRef ref : remaining) {
+    if (ref.isNull()) return 3;
+    actualCounts[(int)data->state.getCard(ref).cardId]++;
+  }
+  for (int i = 0; i < handCount; ++i) requestedCounts[handIds[i]]++;
+  for (int i = 0; i < deckCount; ++i) requestedCounts[deckIds[i]]++;
+  for (int i = 0; i < prizeCount; ++i) requestedCounts[prizeIds[i]]++;
+  if (actualCounts != requestedCounts) return 4;
+  CardList hand, deck, prize;
+  auto appendById = [&](CardList& destination, int cardId, AreaType area,
+    bool reverse) {
+    int found = -1;
+    for (int inputIndex = 0; inputIndex < remaining.size(); ++inputIndex) {
+      if ((int)data->state.getCard(remaining[inputIndex]).cardId == cardId) {
+        found = inputIndex; break;
+      }
+    }
+    if (found < 0) return false;
+    CardRef ref = remaining.take(found);
+    Card& card = data->state.getCard(ref);
+    data->state.cardMoved(ref, area);
+    card.reverse = reverse;
+    destination.push_back(ref);
+    return true;
+  };
+  for (int i = 0; i < handCount; ++i)
+    if (!appendById(hand, handIds[i], AreaType::Hand, false)) return 5;
+  for (int i = 0; i < deckCount; ++i)
+    if (!appendById(deck, deckIds[i], AreaType::Deck, false)) return 6;
+  for (int i = 0; i < prizeCount; ++i)
+    if (!appendById(prize, prizeIds[i], AreaType::Prize, true)) return 7;
+  if (!remaining.empty()) return 8;
+  player.hand = hand; player.deck = deck; player.prize = prize;
+  return 0;
+}
+
 extern "C" GAME_API void ExactReplayTraceEnd(ApiData* data) {
   if (data == nullptr) return;
   data->exactReplayTraceEnabled = false; data->game.config.pauseAtExactTurnLeaf = false;
-  data->exactReplayTurnLeaves.clear(); data->exactReplayLastTurn = -1;
+  data->exactReplayTraceMode = 0; data->exactReplayTurnLeaves.clear();
+  data->exactReplayDecisionStates.clear(); data->exactReplayLastTurn = -1;
 }
 
 extern "C" GAME_API const char8_t* ExactReplayTraceDrain(ApiData* data) {
   if (data == nullptr || data->apiDataType != 1) return nullptr;
+  const int turnLeafCount = data->exactReplayTraceMode == 2 ? 0
+    : (int)data->exactReplayTurnLeaves.size();
+  const int decisionCount = data->exactReplayTraceMode == 1 ? 0
+    : (int)data->exactReplayDecisionStates.size();
   JsonBuilder& j = data->jsonBuilder; j.clear(); j.append('[');
-  for (int sampleIndex = 0; sampleIndex < (int)data->exactReplayTurnLeaves.size(); ++sampleIndex) {
+  for (int sampleIndex = 0; sampleIndex < turnLeafCount + decisionCount; ++sampleIndex) {
     j.comma(sampleIndex);
-    State& state = data->exactReplayTurnLeaves[sampleIndex].first; state.game = &data->game;
-    int actor = data->exactReplayTurnLeaves[sampleIndex].second;
+    const bool isIntermediate = sampleIndex >= turnLeafCount;
+    auto& sample = isIntermediate
+      ? data->exactReplayDecisionStates[sampleIndex - turnLeafCount]
+      : data->exactReplayTurnLeaves[sampleIndex];
+    State& state = sample.first; state.game = &data->game;
+    int actor = sample.second;
     std::unordered_map<int, int> profile;
     for (int id : data->game.config.decks[actor].cards) profile[id]++;
     auto features = ExactSparseEvaluatorV3::extractFeatures(state, actor, &profile);
@@ -522,6 +637,8 @@ extern "C" GAME_API const char8_t* ExactReplayTraceDrain(ApiData* data) {
     unsigned long long hi = ExactSipHash24(featureBytes, 0x494e464f524d4154ULL, 0x494f4e5345545632ULL);
     std::ostringstream key; key << std::hex << std::setfill('0') << std::setw(16) << hi << std::setw(16) << lo;
     j.append('{'); j.appendKeyValue("turn", state.turn); j.appendCommaKeyValue("actor", actor);
+    j.appendCommaKey("sampleKind");
+    j.appendDoubleQuote(isIntermediate ? u8"intermediate" : u8"boundary");
     std::string keyText = key.str();
     j.appendCommaKey("informationStateKey"); j.appendDoubleQuote(keyText.c_str());
     j.appendCommaKeyValue("featureSchemaVersion", 3);
@@ -546,7 +663,8 @@ extern "C" GAME_API const char8_t* ExactReplayTraceDrain(ApiData* data) {
     j.append(']'); j.appendCommaKeyValue("opponentInferenceVersion", 0);
     j.appendCommaKeyValue("overflow", features.overflow); j.append('}');
   }
-  j.append(']'); data->exactReplayTurnLeaves.clear(); return j.buf.c_str();
+  j.append(']'); data->exactReplayTurnLeaves.clear();
+  data->exactReplayDecisionStates.clear(); return j.buf.c_str();
 }
 
 static const char8_t* JsonResult(ApiData* data, const SearchInfo& si) {
@@ -842,6 +960,40 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
   if (sessionId >= 0) { j.appendCommaKey("sessionId"); AppendLongLong(j, sessionId); }
   j.append('}');
   return j.buf.c_str();
+}
+
+static const char8_t* ExactGeneralDecisionJson(ApiData* data,
+	const ExactGeneralDecision& decision) {
+	JsonBuilder& j = data->jsonBuilder;
+	j.clear(); j.append('{');
+	j.appendKey("selected"); j.append('[');
+	for (int i = 0; i < (int)decision.selected.size(); ++i) {
+		j.comma(i); j.append(decision.selected[i]);
+	}
+	j.append(']');
+	j.appendCommaKey("actions"); j.append('[');
+	for (int i = 0; i < (int)decision.actions.size(); ++i) {
+		j.comma(i); j.append('{'); j.appendKey("selected"); j.append('[');
+		for (int k = 0; k < (int)decision.actions[i].action.size(); ++k) {
+			j.comma(k); j.append(decision.actions[i].action[k]);
+		}
+		j.append(']'); j.appendCommaKey("value");
+		AppendLongLong(j, decision.actions[i].value); j.append('}');
+	}
+	j.append(']');
+	j.appendCommaKey("estimatedWork");
+	AppendUnsignedLongLong(j, decision.estimatedWork);
+	j.appendCommaKey("evaluatedActions");
+	AppendUnsignedLongLong(j, decision.evaluatedActions);
+	j.appendCommaKeyValue("candidateSetComplete", decision.candidateSetComplete);
+	j.appendCommaKeyValue("informationSetSafe", decision.informationSetSafe);
+	j.appendCommaKeyValue("modelLoaded", decision.modelLoaded);
+	j.appendCommaKeyValue("certified", false);
+	j.appendCommaKey("decisionMode"); j.appendDoubleQuote(u8"general_one_step_value");
+	j.appendCommaKey("evaluatorModelHash"); AppendUnsignedLongLong(j,
+		data->generalEvaluator ? data->generalEvaluator->modelHash() : 0);
+	j.append('}');
+	return j.buf.c_str();
 }
 
 static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
@@ -2075,6 +2227,89 @@ extern "C" {
       }
     }
     return JsonResult(data, si);
+  }
+
+  GAME_API const char8_t* ExactEstimateRoot(ApiData* data, const char* serialized,
+      int count, int* deck, int* handValues, int deckCount,
+      unsigned long long workThreshold) {
+    if (data->apiDataType != 2 || deckCount <= 0 || deckCount > DECK_SIZE) {
+      data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":30}");
+      return data->jsonBuilder.buf.c_str();
+    }
+    try {
+      SetBattleData(data, serialized, count);
+      ExactPlanner probe(deck, handValues, deckCount, 1000, nullptr, 0,
+        nullptr, data->exactEvaluator);
+      unsigned long long total = 0, maximum = 0;
+      std::vector<unsigned long long> estimates;
+      estimates.reserve(data->state.options.size());
+      for (int option = 0; option < (int)data->state.options.size(); ++option) {
+        unsigned long long estimate = 1;
+        probe.canonicalRootSuccessor(data->state, option, &estimate);
+        estimates.push_back(estimate);
+        maximum = std::max(maximum, estimate);
+        if (total > std::numeric_limits<unsigned long long>::max() - estimate)
+          total = std::numeric_limits<unsigned long long>::max();
+        else total += estimate;
+      }
+      if (workThreshold == 0) workThreshold = 500'000ULL;
+      const bool wideEarlyMain = data->state.selectType == SelectType::Main
+        && data->state.options.size() > 4
+        && data->state.players[data->state.selectPlayer].deck.size() > 20;
+      const bool recommended = maximum >= 1'000'000ULL
+        || total >= workThreshold || wideEarlyMain;
+      JsonBuilder& j = data->jsonBuilder; j.clear(); j.append('{');
+      j.appendKeyValue("error", 0);
+      j.appendCommaKey("totalEstimatedWork"); AppendUnsignedLongLong(j, total);
+      j.appendCommaKey("maximumOptionWork"); AppendUnsignedLongLong(j, maximum);
+      j.appendCommaKey("workThreshold"); AppendUnsignedLongLong(j, workThreshold);
+      j.appendCommaKeyValue("recommendedGeneral", recommended);
+      j.appendCommaKeyValue("wideEarlyMain", wideEarlyMain);
+      j.appendCommaKey("optionWork"); j.append('[');
+      for (int i = 0; i < (int)estimates.size(); ++i) {
+        j.comma(i); AppendUnsignedLongLong(j, estimates[i]);
+      }
+      j.append(']'); j.append('}');
+      return j.buf.c_str();
+    } catch (const std::exception& error) {
+      return ExactErrorJson(data, 99, error.what());
+    } catch (...) {
+      return ExactErrorJson(data, 99, "unknown root-estimator exception");
+    }
+  }
+
+  GAME_API const char8_t* ExactGeneralDecide(ApiData* data, const char* serialized,
+      int count, int* deck, int* handValues, int deckCount,
+      int budgetMilliseconds, unsigned long long maximumCandidates) {
+    if (data->apiDataType != 2 || deckCount <= 0 || deckCount > DECK_SIZE
+        || !data->generalEvaluator) {
+      data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":30}");
+      return data->jsonBuilder.buf.c_str();
+    }
+    try {
+      SetBattleData(data, serialized, count);
+      ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds,
+        nullptr, 0, nullptr, data->generalEvaluator);
+      ExactGeneralDecision decision = planner.evaluateGeneralRoot(
+        data->state, std::max<unsigned long long>(1, maximumCandidates));
+      ExactPlanner estimator(deck, handValues, deckCount, 1000,
+        nullptr, 0, nullptr, data->generalEvaluator);
+      for (int option = 0; option < (int)data->state.options.size(); ++option) {
+        unsigned long long estimate = 1;
+        estimator.canonicalRootSuccessor(data->state, option, &estimate);
+        if (decision.estimatedWork
+            > std::numeric_limits<unsigned long long>::max() - estimate) {
+          decision.estimatedWork = std::numeric_limits<unsigned long long>::max();
+          break;
+        }
+        decision.estimatedWork += estimate;
+      }
+      return ExactGeneralDecisionJson(data, decision);
+    } catch (const std::exception& error) {
+      return ExactErrorJson(data, 99, error.what());
+    } catch (...) {
+      return ExactErrorJson(data, 99, "unknown general-evaluator exception");
+    }
   }
 
   GAME_API const char8_t* ExactDecide(ApiData* data, const char* serialized, int count,

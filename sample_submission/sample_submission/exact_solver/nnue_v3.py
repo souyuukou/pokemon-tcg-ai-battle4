@@ -109,7 +109,8 @@ class QuantizedModel:
             raise ValueError("V3 global accumulator bound exceeds int32")
 
 
-def export_quantized(path: str | Path, model: QuantizedModel) -> None:
+def export_quantized(path: str | Path, model: QuantizedModel, *,
+                     boundary_only: bool = True) -> None:
     model.validate()
     tokens = np.asarray(model.tokens, dtype="<i4")
     header = HEADER.pack(
@@ -132,11 +133,12 @@ def export_quantized(path: str | Path, model: QuantizedModel) -> None:
     )
     payload = header + b"".join(a.tobytes(order="C") for a in arrays) + struct.pack("<q", int(model.output_bias))
     manifest = MANIFEST.pack(MANIFEST_MAGIC, MANIFEST_VERSION, VERSION,
-                             FEATURE_SCHEMA_HASH, BELIEF_SCHEMA_HASH, 1, 1, bytes(6))
+                             FEATURE_SCHEMA_HASH, BELIEF_SCHEMA_HASH, 1,
+                             int(boundary_only), bytes(6))
     Path(path).write_bytes(payload + manifest)
 
 
-def load_quantized(path: str | Path) -> QuantizedModel:
+def load_quantized(path: str | Path, *, boundary_only: bool = True) -> QuantizedModel:
     raw = Path(path).read_bytes()
     if len(raw) < HEADER.size:
         raise ValueError("invalid V3 evaluator length")
@@ -177,8 +179,9 @@ def load_quantized(path: str | Path) -> QuantizedModel:
         raise ValueError("invalid V3 payload length")
     output_bias, = struct.unpack_from("<q", raw, offset)
     manifest = MANIFEST.unpack_from(raw, offset + 8)
-    if manifest[:5] != (MANIFEST_MAGIC, MANIFEST_VERSION, VERSION,
-                        FEATURE_SCHEMA_HASH, BELIEF_SCHEMA_HASH) or not manifest[5] or not manifest[6]:
+    if (manifest[:5] != (MANIFEST_MAGIC, MANIFEST_VERSION, VERSION,
+                         FEATURE_SCHEMA_HASH, BELIEF_SCHEMA_HASH)
+            or not manifest[5] or bool(manifest[6]) != bool(boundary_only)):
         raise ValueError("invalid V3 evaluator manifest")
     result = QuantizedModel(tokens, edw, esw, eb, gdw, gsw, pw, gb, ow, output_bias,
                             dataset_hash, card_checksum, effect_checksum, combo_checksum)

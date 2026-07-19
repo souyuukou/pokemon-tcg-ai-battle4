@@ -103,6 +103,21 @@ def exact_replay_trace_begin() -> None:
     if not Battle.battle_ptr or lib.ExactReplayTraceBegin(Battle.battle_ptr) != 0:
         raise RuntimeError("cannot start exact replay trace")
 
+def exact_replay_intermediate_trace_begin() -> None:
+    """Capture information-safe V3 features at every non-setup decision."""
+    if not hasattr(lib, "ExactReplayIntermediateTraceBegin"):
+        raise RuntimeError("intermediate replay trace is not available")
+    if (not Battle.battle_ptr
+            or lib.ExactReplayIntermediateTraceBegin(Battle.battle_ptr) != 0):
+        raise RuntimeError("cannot start intermediate replay trace")
+
+def exact_replay_dual_trace_begin() -> None:
+    """Capture both boundary and intermediate datasets in one exact replay."""
+    if not hasattr(lib, "ExactReplayDualTraceBegin"):
+        raise RuntimeError("dual replay trace is not available")
+    if not Battle.battle_ptr or lib.ExactReplayDualTraceBegin(Battle.battle_ptr) != 0:
+        raise RuntimeError("cannot start dual replay trace")
+
 
 def exact_replay_set_deck_order(player: int, card_ids: list[int]) -> None:
     """Restore the exact deck order recorded before the next replay action."""
@@ -124,6 +139,22 @@ def exact_replay_set_hidden_zones(player: int, hand_ids: list[int], deck_ids: li
                                           hand, len(hand_ids), deck, len(deck_ids))
     if error:
         raise ValueError(f"cannot restore player {player} hidden zones (error {error})")
+
+def exact_replay_set_all_hidden_zones(player: int, hand_ids: list[int],
+                                      deck_ids: list[int],
+                                      prize_ids: list[int]) -> None:
+    """Restore the replay's exact hand/deck/prize partition and ordering."""
+    if not hasattr(lib, "ExactReplaySetAllHiddenZones") or not Battle.battle_ptr:
+        raise RuntimeError("complete hidden-zone restoration is not available")
+    hand = (ctypes.c_int * len(hand_ids))(*hand_ids)
+    deck = (ctypes.c_int * len(deck_ids))(*deck_ids)
+    prize = (ctypes.c_int * len(prize_ids))(*prize_ids)
+    error = lib.ExactReplaySetAllHiddenZones(
+        Battle.battle_ptr, int(player),
+        hand, len(hand_ids), deck, len(deck_ids), prize, len(prize_ids))
+    if error:
+        raise ValueError(
+            f"cannot restore player {player} complete hidden zones (error {error})")
 
 
 def exact_replay_trace_drain() -> list[dict]:

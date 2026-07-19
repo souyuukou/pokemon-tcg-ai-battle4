@@ -673,6 +673,70 @@ def exact_load_evaluator_model(path: str) -> dict:
         raise RuntimeError(f"Failed to load exact evaluator: {result.get('error', '')}")
     return result
 
+def exact_load_general_evaluator_model(path: str) -> dict:
+    """Load the information-safe, non-boundary general state evaluator."""
+    global agent_ptr
+    if not hasattr(lib, "ExactLoadGeneralEvaluatorModel"):
+        raise RuntimeError("ExactLoadGeneralEvaluatorModel is not available")
+    if "agent_ptr" not in globals():
+        agent_ptr = lib.AgentStart()
+    raw = lib.ExactLoadGeneralEvaluatorModel(
+        agent_ptr, str(path).encode("utf-8"))
+    result = json.loads(raw.decode())
+    if not result.get("loaded"):
+        raise RuntimeError(
+            f"Failed to load general evaluator: {result.get('error', '')}")
+    return result
+
+def exact_estimate_root(agent_observation: Observation, deck: list[int],
+                        hand_values: list[int],
+                        work_threshold: int = 500_000) -> dict:
+    """Estimate root branching before committing the match clock to exact search."""
+    global agent_ptr
+    if not hasattr(lib, "ExactEstimateRoot"):
+        raise RuntimeError("ExactEstimateRoot is not available")
+    if "agent_ptr" not in globals():
+        agent_ptr = lib.AgentStart()
+    if len(deck) != len(hand_values):
+        raise ValueError("deck and hand_values length mismatch")
+    serialized = agent_observation.search_begin_input
+    if serialized is None:
+        raise ValueError("Not agent observation.")
+    deck_arg = (ctypes.c_int * len(deck))(*deck)
+    value_arg = (ctypes.c_int * len(hand_values))(*hand_values)
+    raw = lib.ExactEstimateRoot(
+        agent_ptr, serialized.encode("ascii"), len(serialized),
+        deck_arg, value_arg, len(deck), int(work_threshold))
+    result = json.loads(raw.decode())
+    if result.get("error"):
+        raise RuntimeError(f"ExactEstimateRoot failed: {result['error']}")
+    return result
+
+def exact_general_decide(agent_observation: Observation, deck: list[int],
+                         hand_values: list[int], budget_milliseconds: int,
+                         maximum_candidates: int = 4096) -> dict:
+    """Choose with one-step intermediate-state Value; never claims exactness."""
+    global agent_ptr
+    if not hasattr(lib, "ExactGeneralDecide"):
+        raise RuntimeError("ExactGeneralDecide is not available")
+    if "agent_ptr" not in globals():
+        agent_ptr = lib.AgentStart()
+    if len(deck) != len(hand_values):
+        raise ValueError("deck and hand_values length mismatch")
+    serialized = agent_observation.search_begin_input
+    if serialized is None:
+        raise ValueError("Not agent observation.")
+    deck_arg = (ctypes.c_int * len(deck))(*deck)
+    value_arg = (ctypes.c_int * len(hand_values))(*hand_values)
+    raw = lib.ExactGeneralDecide(
+        agent_ptr, serialized.encode("ascii"), len(serialized),
+        deck_arg, value_arg, len(deck), int(budget_milliseconds),
+        int(maximum_candidates))
+    result = json.loads(raw.decode())
+    if result.get("error"):
+        raise RuntimeError(f"ExactGeneralDecide failed: {result['error']}")
+    return result
+
 def exact_unload_evaluator_model() -> None:
     """Detach the evaluator from future searches; active turn sessions retain it."""
     global agent_ptr

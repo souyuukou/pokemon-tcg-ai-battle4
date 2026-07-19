@@ -8,6 +8,12 @@ build/
 
 # Replay datasets and generated caches
 data/kaggle_replays/
+data/*.jsonl
+data/*.json
+data/*.bin
+data/*.log
+data/*.pid
+data/*.tmp
 *.pt
 
 # Local packaging output (the source files remain tracked)

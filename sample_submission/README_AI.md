@@ -12,8 +12,20 @@ Runtime design:
   transitions, and actions are selected only at the common turn boundary;
 - canonical keys omit card serials, logs, and RNG state;
 - per-turn sessions resume across selections and return exact score intervals;
-- if an information-set proof cannot be completed, the policy fails closed to a
-  deterministic legal fallback rather than using hidden identities.
+- a cheap native estimate runs at the beginning of each own turn; roots with an
+  immediate multi-draw, a large estimated workload, or a wide early Main use
+  the separate general evaluator instead of starting an unlikely-to-finish
+  exhaustive search;
+- `exact-evaluator-v3.bin` is trained only on post-checkup turn boundaries;
+- `general-evaluator-v3.bin` is a separate 30 MB information-set-safe network
+  trained on every non-setup decision state. It applies each semantic candidate
+  once and evaluates the resulting intermediate state. Its ranking includes a
+  bounded observation-safe tactical term for forcing short sequences;
+- the general evaluator also handles unresolved own choices during the
+  opponent's turn and replaces an uncertified exact argmax at the hard time
+  ceiling. It never reports exact certification;
+- only if both native evaluators are unavailable does the policy fail closed to
+  the deterministic legal rule heuristic.
 
 The default deck is fixed to the battle3 list in
 `sample_submission/sample_submission/deck.csv` and the matching profile under
@@ -35,3 +47,34 @@ The checked-in `deck_library.json` and `policy_table.json` were regenerated
 from 10,000 replay JSON files with Laplace-smoothed action frequencies.  The
 learner is streaming: it keeps only one replay and compact counters in memory,
 so it remains suitable for the 3 GB runtime limit.
+
+Retrain both Value models from complete, exactly replayable matches:
+
+```powershell
+python tools/extract_replay_v3_dataset.py data/kaggle_replays data/train-v3-both.jsonl `
+  --mode both --limit 500 --max-replays 6000
+python tools/train_v3_evaluator.py data/train-v3-both.jsonl `
+  sample_submission/sample_submission/exact-evaluator-v3.bin `
+  --initial-model sample_submission/sample_submission/exact-evaluator-v3.bin `
+  --sample-kind boundary --boundary-only --epochs 20
+python tools/train_v3_evaluator.py data/train-v3-both.jsonl `
+  sample_submission/sample_submission/general-evaluator-v3.bin `
+  --initial-model sample_submission/sample_submission/exact-evaluator-v3.bin `
+  --sample-kind intermediate --epochs 20
+```
+
+Each replay contributes total loss weight one independently to each dataset.
+Any version, random, action, restoration, or terminal mismatch rejects the
+entire replay; a valid prefix is never retained.
+
+Run the generic-policy fixed-deck benchmark against the previous emergency
+heuristic on both seats:
+
+```powershell
+python tools/evaluate_general_selfplay.py --seed-count 50 `
+  --opponent heuristic --both-seats --work-threshold 1 `
+  --output data/general-vs-heuristic.json
+```
+
+The checked-in training run's final verification completed all 100 games,
+winning 57–43 with 258,084,864 peak RSS.

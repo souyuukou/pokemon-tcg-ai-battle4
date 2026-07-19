@@ -24,10 +24,23 @@ struct SerialData {
 };
 
 inline void ApiCaptureExactReplayTurnLeaf(ApiData* data) {
-	if (data == nullptr || !data->exactReplayTraceEnabled || data->state.isFinish()
+	if (data == nullptr || !data->exactReplayTraceEnabled
+		|| (data->exactReplayTraceMode != 1 && data->exactReplayTraceMode != 3)
+		|| data->state.isFinish()
 		|| !IsExactTurnLeaf(data->state) || data->exactReplayLastTurn == data->state.turn) return;
 	data->exactReplayLastTurn = data->state.turn;
 	data->exactReplayTurnLeaves.push_back({ data->state, data->state.activePlayerIndex() });
+}
+
+inline void ApiCaptureExactReplayDecisionState(ApiData* data) {
+	if (data == nullptr || !data->exactReplayTraceEnabled
+		|| (data->exactReplayTraceMode != 2 && data->exactReplayTraceMode != 3)
+		|| data->state.isFinish() || data->state.turn <= 0
+		|| data->state.selectPlayer < 0 || data->state.selectPlayer >= 2
+		|| data->state.selectType == SelectType::None) return;
+	data->exactReplayDecisionStates.push_back({
+		data->state, data->state.selectPlayer
+	});
 }
 
 inline StartData ApiBattleStartSeeded(int* cards, unsigned int seed, bool deterministic,
@@ -148,6 +161,7 @@ inline void SetBattleData(ApiData* data, const char* base64, int count) {
 
 inline int ApiSelect(ApiData* data, int* select, int selectCount) {
 	State& state = data->state;
+	ApiCaptureExactReplayDecisionState(data);
 	state.selected.clear();
 	for (int i : range(selectCount)) {
 		state.selected.push_back(select[i]);
