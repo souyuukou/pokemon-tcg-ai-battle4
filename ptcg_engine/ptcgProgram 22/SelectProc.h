@@ -391,6 +391,13 @@ inline void SelectedPrize(State& state) {
 inline void SelectPrize2(State& state, int playerIndex, int count) {
 	const PlayerState& ps = state.players.at(playerIndex);
 	int selectCount = std::min(count, ps.prize.size());
+	if (state.exact.enabled && state.exact.prizeExchangeable[playerIndex] && selectCount > 0) {
+		state.targetList.clear();
+		state.exact.pending = ExactPendingType::TakePrize;
+		state.exact.pendingPlayer = (signed char)playerIndex;
+		state.exact.pendingCount = (unsigned char)selectCount;
+		return;
+	}
 	state.setSelect(SelectType::Card, SelectContext::ToHand, playerIndex, selectCount, selectCount);
 	for (int i : range(ps.prize)) {
 		AddOptionCard(state, AreaType::Prize, i, playerIndex);

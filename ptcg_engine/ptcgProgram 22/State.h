@@ -37,6 +37,81 @@ enum class GamePhase : unsigned char {
 	PokemonCheckupEnd = 3,
 };
 
+enum class ExactPendingType : unsigned char {
+	None = 0,
+	Draw,
+	RevealDeck,
+	TakePrize,
+	Opaque,
+};
+
+enum class ExactQueryIntent : unsigned char {
+	ConcreteCards = 0,
+	CountOnly,
+	ExistsOnly,
+};
+
+enum class ExactBlockReason : unsigned char {
+	None = 0,
+	UnknownOpponentList,
+	UnsupportedConcreteReference,
+	InterruptedTransition,
+	Exception,
+};
+
+// Compact actor-relative hidden state. Until the deck is legally observed,
+// deck and face-down prizes are one exchangeable pool plus the two zone sizes.
+struct ExactHiddenState {
+	bool enabled = false;
+	signed char actor = -1;
+	std::array<bool, 2> deckUnknown = {};
+	std::array<bool, 2> deckExchangeable = {};
+	std::array<bool, 2> prizeExchangeable = {};
+	ExactPendingType pending = ExactPendingType::None;
+	signed char pendingPlayer = -1;
+	unsigned char pendingCount = 0;
+	short pendingDetail = 0;
+	ExactQueryIntent pendingIntent = ExactQueryIntent::ConcreteCards;
+	ExactBlockReason blockReason = ExactBlockReason::None;
+	int pendingEffectCardId = 0;
+	signed char pendingEffectPlayer = -1;
+	int pendingSkillId = 0;
+	int pendingEffectIndex = -1;
+	unsigned char pendingNullCount = 0;
+	std::array<unsigned char, 2> typeCount = {};
+	std::array<std::array<int, DECK_SIZE>, 2> cardId = {};
+	std::array<std::array<unsigned char, DECK_SIZE>, 2> cardCount = {};
+	std::array<bool, 2> profileKnown = {};
+	// The fixed-deck bootstrap may use a deterministic opponent choice while
+	// retaining exact chance weights.  Such a state is playable and evaluable,
+	// but it is not a minimax certificate.
+	bool provisionalOpponentPolicy = false;
+
+	void clearPending() {
+		pending = ExactPendingType::None;
+		pendingPlayer = -1;
+		pendingCount = 0;
+		pendingDetail = 0;
+		pendingIntent = ExactQueryIntent::ConcreteCards;
+		blockReason = ExactBlockReason::None;
+		pendingEffectCardId = 0;
+		pendingEffectPlayer = -1;
+		pendingSkillId = 0;
+		pendingEffectIndex = -1;
+		pendingNullCount = 0;
+	}
+
+	void addHiddenCard(int player, int id) {
+		for (int i = 0; i < typeCount[player]; ++i) {
+			if (cardId[player][i] == id) { cardCount[player][i]++; return; }
+		}
+		if (typeCount[player] >= DECK_SIZE) Exception("exact hidden type overflow");
+		int index = typeCount[player]++;
+		cardId[player][index] = id;
+		cardCount[player][index] = 1;
+	}
+};
+
 struct CardPosition {
 	AreaType area;
 	int areaIndex;
@@ -235,9 +310,16 @@ struct State {
 	std::vector<GameFunction> functionStack;
 	std::vector<Log> logs;
 
+	// Search-only state must remain outside the raw wire-format prefix copied by
+	// serialize()/deserialize().  Placing this before `options` changes every
+	// following offset and makes observations emitted by the official runtime
+	// deserialize as a different State.
+	ExactHiddenState exact;
+
 	void clear() {
 		int count = (int)((unsigned char*)&options - (unsigned char*)&turn);
 		std::memset(&turn, 0, count);
+		exact = ExactHiddenState{};
 	}
 
 	void serialize(BinaryWriter& b) const {
@@ -260,6 +342,7 @@ struct State {
 	}
 
 	void deserialize(BinaryReader& b) {
+		exact = ExactHiddenState{};
 		b.set(&turn, &options);
 
 		b.set(options);
@@ -1733,10 +1816,25 @@ struct State {
 	// 1手進める
 	// 終了したらfalseを返す
 	bool step() {
+		if (exact.enabled && exact.pending != ExactPendingType::None) {
+			return true;
+		}
 		callFunction();
+		if (exact.enabled && exact.pending != ExactPendingType::None) {
+			return true;
+		}
+		if ((exact.enabled || game->config.pauseAtExactTurnLeaf) && phase == GamePhase::PokemonCheckupEnd) {
+			return true;
+		}
 		while (!isFinish()) {
 			if (selectType == SelectType::None) {
 				callFunction();
+				if (exact.enabled && exact.pending != ExactPendingType::None) {
+					return true;
+				}
+				if ((exact.enabled || game->config.pauseAtExactTurnLeaf) && phase == GamePhase::PokemonCheckupEnd) {
+					return true;
+				}
 				continue;
 			}
 			int optionSize = (int)options.size();

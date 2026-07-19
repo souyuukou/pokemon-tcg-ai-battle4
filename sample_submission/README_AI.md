@@ -1,25 +1,28 @@
 # Boundary-search submission agent
 
-The runnable agent is `sample_submission/main.py`.
+The runnable agent is `sample_submission/main.py`.  Its default deck is the
+hash-verified battle3 profile `majkel1337-85795098` (60 cards, canonical SHA
+`3f4515092dc59df397f365a9b79c7cf0c1cb73b9aa38bc47c1b18e9df4c2fdaf`).
 
 Runtime design:
 
-- card-count determinizations are sampled without replacement;
-- opponent decks are selected from a 256-archetype, 47 KB replay prior;
-- only Main selections invoke the simulator search API;
-- each candidate is advanced through the complete current turn;
-- evaluation occurs after control reaches the opponent;
-- replay policy statistics affect branch order, not terminal scoring;
-- search memory is released after every determinization;
-- simulator states are capped at 1,200 per search and line depth at 36.
+- the native `ExactPlanner` is called through the exported simulator API;
+- hidden deck/prize information is kept as correlated weighted worlds;
+- draw, prize, reveal, and pending effects are resumable chance/observation
+  transitions, and actions are selected only at the common turn boundary;
+- canonical keys omit card serials, logs, and RNG state;
+- per-turn sessions resume across selections and return exact score intervals;
+- if an information-set proof cannot be completed, the policy fails closed to a
+  deterministic legal fallback rather than using hidden identities.
 
-The submitted deck is a frequently observed Mega Lucario archetype. In the
-local replay sample, the closest list recorded 615 wins in 708 games.
+The default deck is fixed to the battle3 list in
+`sample_submission/sample_submission/deck.csv` and the matching profile under
+`exact_solver/decks/`.
 
 Validation:
 
 ```powershell
-python -m unittest sample_submission/tests/test_agent.py
+python -m unittest discover -s sample_submission/tests -v
 ```
 
 Regenerate the compact replay priors:

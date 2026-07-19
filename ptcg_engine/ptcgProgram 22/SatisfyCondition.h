@@ -20,6 +20,11 @@ inline bool SatisfyCondition(const State& state, const std::vector<Effect>& effe
 		for (int i = effectIndex + 1; i < std::ssize(effects); i++) {
 			const Effect& e = effects[i];
 			if (!e.isCondition) {
+				int exactCount = ExactIdentityFreeTargetCount(state, e.target, state.makeAreaRef(effectCard), effectOwner);
+				if (exactCount >= 0) {
+					if (exactCount > 0) { found = true; break; }
+					continue;
+				}
 				TargetList(state, e.target, targetList, state.makeAreaRef(effectCard), effectOwner);
 				if (targetList.size() > 0) {
 					found = true;
@@ -30,11 +35,15 @@ inline bool SatisfyCondition(const State& state, const std::vector<Effect>& effe
 		return BoolCompare(found, effect.comparatorType);
 	}
 	case ConditionType::CountTarget: {
+		int exactCount = ExactIdentityFreeTargetCount(state, effect.target, state.makeAreaRef(effectCard), effectOwner);
+		if (exactCount >= 0) return Compare(exactCount, effect.values[0], effect.comparatorType);
 		std::vector<AreaRef>& targetList = state.game->targetList;
 		TargetList(state, effect.target, targetList, state.makeAreaRef(effectCard), effectOwner);
 		return Compare((int)targetList.size(), effect.values[0], effect.comparatorType);
 	}
 	case ConditionType::CountTarget2: {
+		int exactCount = ExactIdentityFreeTargetCount(state, effect.target, state.makeAreaRef(effectCard), effectOwner);
+		if (exactCount >= 0) return BoolCompare(effect.values[0] == exactCount || effect.values[1] == exactCount, effect.comparatorType);
 		std::vector<AreaRef>& targetList = state.game->targetList;
 		TargetList(state, effect.target, targetList, state.makeAreaRef(effectCard), effectOwner);
 		int count = (int)targetList.size();
@@ -46,17 +55,23 @@ inline bool SatisfyCondition(const State& state, const std::vector<Effect>& effe
 		Target target = effect.target;
 
 		target.targetPlayer = TargetPlayer::Me;
-		TargetList(state, target, targetList, state.makeAreaRef(effectCard), effectOwner);
-		int countMe = (int)targetList.size();
+		int countMe = ExactIdentityFreeTargetCount(state, target, state.makeAreaRef(effectCard), effectOwner);
+		if (countMe < 0) { TargetList(state, target, targetList, state.makeAreaRef(effectCard), effectOwner); countMe = (int)targetList.size(); }
 
 		target.targetPlayer = TargetPlayer::Enemy;
-		TargetList(state, target, targetList, state.makeAreaRef(effectCard), effectOwner);
-		int countEnemy = (int)targetList.size();
+		int countEnemy = ExactIdentityFreeTargetCount(state, target, state.makeAreaRef(effectCard), effectOwner);
+		if (countEnemy < 0) { TargetList(state, target, targetList, state.makeAreaRef(effectCard), effectOwner); countEnemy = (int)targetList.size(); }
 
 		return Compare(countMe, effect.values[0], effect.comparatorType)
 			|| Compare(countEnemy, effect.values[1], effect.comparatorType);
 	}
 	case ConditionType::CompareCountTargetMeEnemy: {
+		Target target = effect.target;
+		target.targetPlayer = TargetPlayer::Me;
+		int countMe = ExactIdentityFreeTargetCount(state, target, state.makeAreaRef(effectCard), effectOwner);
+		target.targetPlayer = TargetPlayer::Enemy;
+		int countEnemy = ExactIdentityFreeTargetCount(state, target, state.makeAreaRef(effectCard), effectOwner);
+		if (countMe >= 0 && countEnemy >= 0) return Compare(countMe, countEnemy, effect.comparatorType);
 		std::vector<AreaRef>& targetList = state.game->targetList;
 		TargetList(state, effect.target, targetList, state.makeAreaRef(effectCard), effectOwner);
 		std::array<int, 2> counts = {};

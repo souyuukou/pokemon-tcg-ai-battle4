@@ -242,8 +242,17 @@ inline void SelectedIsFirst(State& state) {
 
 // ゲーム開始時処理
 inline void SetupGame(State& state) {
-	for (int i : range(2)) {
-		ShuffleDeck(state, i, true);
+	if (!state.game->config.initialDeckAlreadyShuffled) {
+		for (int i : range(2)) ShuffleDeck(state, i, true);
+	} else if (state.game->config.advanceInitialShuffleRng) {
+		// Official 1.30.x replays were recorded before the portable seeded
+		// Fisher-Yates implementation was introduced.  Consume the legacy
+		// std::shuffle sequence without changing the supplied saved order.
+		std::array<int, DECK_SIZE> dummy = {};
+		for (int playerIndex : range(2)) {
+			for (int i : range(DECK_SIZE)) dummy[i] = i;
+			std::shuffle(dummy.begin(), dummy.end(), state.game->rng);
+		}
 	}
 
 	SetYesNoSelect(state, SelectContext::IsFirst, 0);

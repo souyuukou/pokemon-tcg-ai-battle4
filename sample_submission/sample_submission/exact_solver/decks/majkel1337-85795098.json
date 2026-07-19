@@ -1,0 +1,31 @@
+{
+  "name": "majkel1337-85795098",
+  "cards": [
+    {"id": 5, "count": 2},
+    {"id": 13, "count": 1},
+    {"id": 19, "count": 4},
+    {"id": 66, "count": 2},
+    {"id": 140, "count": 1},
+    {"id": 305, "count": 3},
+    {"id": 343, "count": 1},
+    {"id": 741, "count": 4},
+    {"id": 742, "count": 4},
+    {"id": 743, "count": 4},
+    {"id": 1079, "count": 3},
+    {"id": 1081, "count": 4},
+    {"id": 1086, "count": 4},
+    {"id": 1097, "count": 1},
+    {"id": 1129, "count": 1},
+    {"id": 1152, "count": 4},
+    {"id": 1182, "count": 3},
+    {"id": 1184, "count": 1},
+    {"id": 1197, "count": 3},
+    {"id": 1225, "count": 4},
+    {"id": 1231, "count": 4},
+    {"id": 1266, "count": 2}
+  ],
+  "evaluator": {
+    "hand_values": {"default": 100}
+  },
+  "canonical_sha256": "3f4515092dc59df397f365a9b79c7cf0c1cb73b9aa38bc47c1b18e9df4c2fdaf"
+}

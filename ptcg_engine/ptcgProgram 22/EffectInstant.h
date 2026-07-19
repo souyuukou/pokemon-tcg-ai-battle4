@@ -1327,10 +1327,10 @@ inline void EffectInstatnt(State& state) {
 				const Skill* delay;
 				if (state.onAttack()) {
 					const Attack& attack = state.getAttack();
-					delay = CardTable.at(attack.cardId).delay;
+					delay = GetCardMaster(attack.cardId).delay;
 				} else {
 					const Skill& skill = state.getSkill();
-					delay = CardTable.at(skill.cardId).delay;
+					delay = GetCardMaster(skill.cardId).delay;
 				}
 				assert(delay != nullptr);
 				TriggeredAbility ta = {};

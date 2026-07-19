@@ -13,6 +13,10 @@ data/kaggle_replays/
 # Local packaging output (the source files remain tracked)
 sample_submission/submission.zip
 sample_submission/submission_ready.zip
+sample_submission/sample_submission/cg/*.exp
+sample_submission/sample_submission/cg/*.lib
+sample_submission/sample_submission/cg/*.pdb
+sample_submission/sample_submission/cg/*.ilk
 
 # IDE and OS files
 .vs/

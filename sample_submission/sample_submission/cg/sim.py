@@ -33,6 +33,13 @@ lib.GameInitialize()
 lib.BattleStart.restype = StartData
 lib.BattleStart.argtypes = [ctypes.POINTER(ctypes.c_int)]
 
+if hasattr(lib, "BattleStartSeeded"):
+    lib.BattleStartSeeded.restype = StartData
+    lib.BattleStartSeeded.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint]
+if hasattr(lib, "BattleStartOrdered"):
+    lib.BattleStartOrdered.restype = StartData
+    lib.BattleStartOrdered.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint]
+
 lib.AgentStart.restype = ctypes.c_void_p
 
 lib.BattleFinish.argtypes = [ctypes.c_void_p]
@@ -65,6 +72,98 @@ lib.SearchStep.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.POINTER(ctype
 lib.SearchEnd.argtypes = [ctypes.c_void_p]
 
 lib.SearchRelease.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+
+if hasattr(lib, "ExactDecide"):
+    lib.ExactDecide.restype = ctypes.c_char_p
+    lib.ExactDecide.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+        ctypes.c_int, ctypes.c_int]
+
+if hasattr(lib, "ExactEvaluateAction"):
+    lib.ExactEvaluateAction.restype = ctypes.c_char_p
+    lib.ExactEvaluateAction.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+        ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+if hasattr(lib, "ExactDecideV2"):
+    lib.ExactDecideV2.restype = ctypes.c_char_p
+    lib.ExactDecideV2.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
+
+if hasattr(lib, "ExactEvaluateActionV2"):
+    lib.ExactEvaluateActionV2.restype = ctypes.c_char_p
+    lib.ExactEvaluateActionV2.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+if hasattr(lib, "ExactTurnBegin"):
+    lib.ExactTurnBegin.restype = ctypes.c_char_p
+    lib.ExactTurnBegin.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
+
+if hasattr(lib, "ExactTurnAdvance"):
+    lib.ExactTurnAdvance.restype = ctypes.c_char_p
+    lib.ExactTurnAdvance.argtypes = [
+        ctypes.c_void_p, ctypes.c_int64, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+
+if hasattr(lib, "ExactTurnProgress"):
+    lib.ExactTurnProgress.restype = ctypes.c_char_p
+    lib.ExactTurnProgress.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+
+if hasattr(lib, "ExactLoadEvaluatorModel"):
+    lib.ExactLoadEvaluatorModel.restype = ctypes.c_char_p
+    lib.ExactLoadEvaluatorModel.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+if hasattr(lib, "ExactUnloadEvaluatorModel"):
+    lib.ExactUnloadEvaluatorModel.argtypes = [ctypes.c_void_p]
+if hasattr(lib, "ExactArithmeticDiagnostics"):
+    lib.ExactArithmeticDiagnostics.restype = ctypes.c_char_p
+if hasattr(lib, "ExactEvaluatorTokensV3"):
+    lib.ExactEvaluatorTokensV3.restype = ctypes.c_char_p
+if hasattr(lib, "ExactEvaluatorV3Diagnostics"):
+    lib.ExactEvaluatorV3Diagnostics.restype = ctypes.c_char_p
+if hasattr(lib, "ExactCardLivenessV4Diagnostics"):
+    lib.ExactCardLivenessV4Diagnostics.restype = ctypes.c_char_p
+if hasattr(lib, "ExactCardLivenessV4SchemaVersion"):
+    lib.ExactCardLivenessV4SchemaVersion.restype = ctypes.c_int
+if hasattr(lib, "ExactPassiveExpectationV4Oracle"):
+    lib.ExactPassiveExpectationV4Oracle.restype = ctypes.c_char_p
+    lib.ExactPassiveExpectationV4Oracle.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+if hasattr(lib, "ExactEvaluateFeaturesV3"):
+    lib.ExactEvaluateFeaturesV3.restype = ctypes.c_int64
+    lib.ExactEvaluateFeaturesV3.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+
+if hasattr(lib, "ExactReplayTraceBegin"):
+    lib.ExactReplayTraceBegin.restype = ctypes.c_int
+    lib.ExactReplayTraceBegin.argtypes = [ctypes.c_void_p]
+if hasattr(lib, "ExactReplaySetDeckOrder"):
+    lib.ExactReplaySetDeckOrder.restype = ctypes.c_int
+    lib.ExactReplaySetDeckOrder.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                             ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+if hasattr(lib, "ExactReplaySetHiddenZones"):
+    lib.ExactReplaySetHiddenZones.restype = ctypes.c_int
+    lib.ExactReplaySetHiddenZones.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                               ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                                               ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+if hasattr(lib, "ExactReplayTraceDrain"):
+    lib.ExactReplayTraceDrain.restype = ctypes.c_char_p
+    lib.ExactReplayTraceDrain.argtypes = [ctypes.c_void_p]
+if hasattr(lib, "ExactReplayTraceEnd"):
+    lib.ExactReplayTraceEnd.argtypes = [ctypes.c_void_p]
+
+if hasattr(lib, "ExactTurnRelease"):
+    lib.ExactTurnRelease.argtypes = [ctypes.c_void_p, ctypes.c_int64]
 
 lib.AllCard.restype = ctypes.c_char_p
 

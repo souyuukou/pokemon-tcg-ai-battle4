@@ -1,7 +1,10 @@
 # Implementation status
 
-The implementation is split at the existing engine's randomness boundary so
-that unsupported randomness fails closed rather than being reported as exact.
+The runnable submission is now connected to the native exact-turn planner in
+`ptcg_engine/ptcgProgram 22`.  The standalone `boundary_ai` core remains the
+small, engine-independent reference implementation; the competition path uses
+the native planner because it can suspend engine effects at hidden-information
+boundaries.
 
 ## Implemented
 
@@ -15,27 +18,19 @@ that unsupported randomness fails closed rather than being reported as exact.
   capacity changes.
 - `evaluation/`: a boundary feature type with no concrete hidden-world field,
   a bounded model interface, and a visible-state baseline value.
-- Existing-engine integration: `BoundarySearch.h` advances `State::step()`,
-  enumerates all legal selection combinations, exposes manual coins as exact
-  chance nodes, and recognizes the post-checkup next-player boundary.
+- Existing-engine integration: `ExactHiddenState` is carried in the real
+  `State`, and `ExactPlanner` drives `Draw`, `TakePrize`, `RevealDeck`, and
+  opaque pending effects through resumable pending transitions.  `Export.cpp`
+  exposes `ExactTurnBegin`, `ExactTurnAdvance`, `ExactDecide`, progress, and
+  release APIs used by `sample_submission/main.py`.
+- Information-set safety: hidden deck/prize assignments are represented as
+  correlated weighted worlds, are conditioned only after observations, and are
+  merged by serial-independent canonical keys.  Native metrics fail closed on
+  illegal information-set splits or hidden-information leaks.
+- Resource limits: the planner uses two workers, a bounded state/key arena,
+  exact rational weights, resumable per-turn sessions, and interval results
+  when the 600-second/3 GB runtime budget is reached.
 - Tests: probability normalization, compressed-vs-physical draw equivalence,
   MDD sharing, observation-contingent policy, TT merging, boundary-only Value,
-  interval interruption, partial-order safety, and adapter compilation.
-
-## Next engine refactor
-
-`Draw` and `ShuffleDeck` currently execute synchronously inside card-effect
-functions. Exact hidden-information branching cannot safely suspend there
-because the current effect function would restart and duplicate side effects.
-The next integration step is therefore to convert those primitives into
-resumable pending effects. Until that is done, the fully observed adapter
-throws when it sees a shuffle and never labels that branch exact.
-
-After resumable draw/search/shuffle primitives are available:
-
-1. bind each pending primitive to `HiddenPool`/`PrizeMDD`;
-2. emit an `ObservationExpansion` when the acting player learns its outcome;
-3. keep unobserved outcomes in a `ChanceExpansion` without adding them to the
-   information-state key;
-4. add full-engine exhaustive-oracle tests on reduced mini decks;
-5. connect the trained boundary model and competition-agent API.
+  interval interruption, partial-order safety, adapter compilation, the
+  battle3 deck profile hash, and a native hidden-world smoke test.

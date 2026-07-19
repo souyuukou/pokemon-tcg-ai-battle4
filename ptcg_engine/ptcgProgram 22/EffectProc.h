@@ -167,6 +167,9 @@ inline void RefreshEffect(State& state, int depth) {
 			state.getCard(ref).continualState = {};
 		}
 		for (CardRef ref : ps.hand) {
+			if (ref.isNull()) {
+				continue;
+			}
 			state.getCard(ref).continualState = {};
 		}
 
@@ -181,7 +184,11 @@ inline void RefreshEffect(State& state, int depth) {
 	std::vector<CardEffect>& cardList = state.game->cardEffectList;
 	cardList.clear();
 
-	auto func = [&state, &cardList](CardRef ref) {
+	auto func = [&state, &cardList](CardRef ref, bool opaqueIfNull = true) {
+		if (ref.isNull()) {
+			if (state.exact.enabled && opaqueIfNull) state.exact.pending = ExactPendingType::Opaque;
+			return;
+		}
 		Card& card = state.getCard(ref);
 		const CardMaster& master = card.getMaster();
 		const Skill* ability = state.getAbility(card, master);
@@ -214,7 +221,11 @@ inline void RefreshEffect(State& state, int depth) {
 			func(ref);
 		}
 		for (CardRef ref : ps.hand) {
-			func(ref);
+			// The current card set has only an owner-turn hand ability.  An
+			// opponent's sanitized hand therefore cannot contribute a continual
+			// effect while we search this turn.  Keep the active player's hand
+			// conservative in case a future caller supplies hidden own cards.
+			func(ref, i == state.activePlayerIndex());
 		}
 	}
 	for (CardRef ref : state.stadium) {

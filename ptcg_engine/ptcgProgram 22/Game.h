@@ -38,6 +38,11 @@ struct GameConfig {
 	bool manualCoin;
 	bool sendDeck;
 	bool deviceRand;
+	bool initialDeckAlreadyShuffled;
+	// Replay restoration supplies the saved post-shuffle order, but later
+	// shuffles must observe the same RNG state as the recorded battle.
+	bool advanceInitialShuffleRng = false;
+	bool pauseAtExactTurnLeaf;
 };
 
 struct AttackEnergy {
@@ -82,6 +87,10 @@ struct Game {
 			this->config.seed = std::random_device()();
 		}
 		rng = std::mt19937(this->config.seed);
+		// Exact evaluator scratch is reserved once here; leaf inference itself
+		// never grows these vectors or performs heap allocation.
+		energyList.reserve(64); energyList2.reserve(64); cardList.reserve(128);
+		attackEnergyList.reserve(16);
 	}
 
 	bool isAddLog() const {

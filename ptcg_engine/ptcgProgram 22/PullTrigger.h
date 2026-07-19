@@ -55,6 +55,10 @@ inline bool IsTriggerTarget(const State& state, CardRef ref, const Target& targe
 }
 
 inline void TriggerList(State& state, TriggerType triggerType, CardRef subject, CardRef object, CardRef effectCard, int depth) {
+	if (effectCard.isNull()) {
+		if (state.exact.enabled) state.exact.pending = ExactPendingType::Opaque;
+		return;
+	}
 	const Card& card = state.getCard(effectCard);
 	const CardMaster& master = card.getMaster();
 	const Skill* ability = state.getAbility(card, master);

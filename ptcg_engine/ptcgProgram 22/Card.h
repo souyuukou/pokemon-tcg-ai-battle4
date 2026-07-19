@@ -156,9 +156,33 @@ struct CardMaster {
 };
 
 inline std::unordered_map<CardId, CardMaster> CardTable; // Both card master
+inline std::vector<const CardMaster*> CardMasterById;
 inline std::unordered_map<int, Skill> SkillTable;
 inline std::unordered_map<int, Attack> AttackTable;
 inline std::unordered_map<std::u8string, int> NameTable;
+
+inline void InitializeCardMasterIndex() {
+	int maximum = 0;
+	for (const auto& entry : CardTable) maximum = std::max(maximum, (int)entry.first);
+	CardMasterById.assign((size_t)maximum + 1, nullptr);
+	for (const auto& entry : CardTable) if (entry.first >= 0)
+		CardMasterById[(size_t)entry.first] = &entry.second;
+}
+
+inline const CardMaster& GetCardMaster(CardId cardId) {
+	if (cardId >= 0 && (size_t)cardId < CardMasterById.size()) {
+		const CardMaster* master = CardMasterById[(size_t)cardId];
+		if (master != nullptr) return *master;
+	}
+	return CardTable.at(cardId);
+}
+
+inline const CardMaster* FindCardMaster(CardId cardId) {
+	if (cardId >= 0 && (size_t)cardId < CardMasterById.size())
+		return CardMasterById[(size_t)cardId];
+	auto found = CardTable.find(cardId);
+	return found == CardTable.end() ? nullptr : &found->second;
+}
 
 // 次の自分の番、自分は～/次の相手の番、相手は～
 union CardNextTurnState {
@@ -381,7 +405,7 @@ struct Card {
 	}
 
 	const CardMaster& getMaster() const {
-		return CardTable.at(cardId);
+		return GetCardMaster(cardId);
 	}
 
 	ByteFixedList<EnergyType, 2> getEnergyType() const{

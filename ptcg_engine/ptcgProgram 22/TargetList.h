@@ -582,6 +582,30 @@ inline void AddIfTarget(const State& state, CardRef ref, const Target& target, s
 }
 
 // targetに合致する対象をoutputに入れる
+inline int ExactIdentityFreeTargetCount(const State& state, const Target& target, AreaRef effectCard, int effectOwner) {
+	if (!state.exact.enabled || !target.conditions.empty()) return -1;
+	int count = 0;
+	for (int playerIndex : state.basicPlayerOrder()) {
+		if (!IsTargetPlayer(effectOwner, playerIndex, target.targetPlayer)) continue;
+		const PlayerState& ps = state.players[playerIndex];
+		for (AreaType area : target.areas) {
+			switch (area) {
+			case AreaType::Deck: count += (int)ps.deck.size(); break;
+			case AreaType::Hand: count += (int)ps.hand.size(); break;
+			case AreaType::Prize: count += (int)ps.prize.size(); break;
+			default: return -1;
+			}
+		}
+	}
+	if (target.notMe && !effectCard.card.isNull()) {
+		const Card& card = state.getCard(effectCard.card);
+		if (IsTargetPlayer(effectOwner, card.playerIndex, target.targetPlayer)) {
+			for (AreaType area : target.areas) if (card.area == area) { count--; break; }
+		}
+	}
+	return std::max(0, count);
+}
+
 inline void TargetList(const State& state, const Target& target, std::vector<AreaRef>& output, AreaRef effectCard, int effectOwner) {
 	if (target.areas.size() == 0) {
 		output.clear();
@@ -671,14 +695,48 @@ inline void TargetList(const State& state, const Target& target, std::vector<Are
 			}
 			const PlayerState& ps = state.players[playerIndex];
 			for (AreaType areaType : target.areas) {
+					auto deferUnknown = [&](const auto& list, ExactPendingType ownType) {
+					if (!state.exact.enabled) return false;
+					int nullCount = 0;
+					for (CardRef candidate : list) if (candidate.isNull()) nullCount++;
+					for (CardRef ref : list) {
+						if (ref.isNull()) {
+							State& mutableState = const_cast<State&>(state);
+							bool profileKnown = playerIndex == state.exact.actor || state.exact.profileKnown[playerIndex];
+							mutableState.exact.pending = (profileKnown ? ownType : ExactPendingType::Opaque);
+							mutableState.exact.pendingPlayer = (signed char)playerIndex;
+							mutableState.exact.pendingDetail = (short)((int)areaType + 100 * playerIndex);
+							mutableState.exact.pendingIntent = ExactQueryIntent::ConcreteCards;
+							mutableState.exact.blockReason = profileKnown
+								? ExactBlockReason::InterruptedTransition : ExactBlockReason::UnknownOpponentList;
+							if (!effectCard.card.isNull()) {
+								mutableState.exact.pendingEffectCardId = state.getCard(effectCard.card).cardId;
+								mutableState.exact.pendingEffectPlayer = (signed char)state.getCard(effectCard.card).playerIndex;
+							}
+							if (state.onEffect()) {
+								mutableState.exact.pendingSkillId = state.effectState.ability.skillId;
+								mutableState.exact.pendingEffectIndex = state.effectState.effectIndex;
+							}
+							mutableState.exact.pendingNullCount = (unsigned char)std::min(nullCount, 255);
+							return true;
+						}
+					}
+					return false;
+				};
 				switch (areaType)
 				{
 				case AreaType::Deck:
+					if (deferUnknown(ps.deck, ExactPendingType::RevealDeck)) return;
 					for (CardRef ref : ps.deck) {
 						AddIfTarget(state, ref, target, output, effectCard);
 					}
 					break;
 				case AreaType::Hand:
+					// A known validation profile can enumerate an unknown hand in the
+					// same replayable way as a deck reveal.  The pending detail keeps
+					// the actual zone, so the planner does not expose the deck merely
+					// because the implementation uses one interruption kind.
+					if (deferUnknown(ps.hand, ExactPendingType::RevealDeck)) return;
 					if (target.skipEnemyTarget && playerIndex != state.getCard(effectCard.card).playerIndex) {
 						for (CardRef ref : ps.hand) {
 							output.push_back(state.makeAreaRef(ref));
@@ -705,6 +763,7 @@ inline void TargetList(const State& state, const Target& target, std::vector<Are
 					}
 					break;
 				case AreaType::Prize:
+					if (deferUnknown(ps.prize, ExactPendingType::TakePrize)) return;
 					for (CardRef ref : ps.prize) {
 						AddIfTarget(state, ref, target, output, effectCard);
 					}

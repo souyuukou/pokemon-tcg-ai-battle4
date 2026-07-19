@@ -638,5 +638,190 @@ def search_release(search_id: int) -> None:
     """
     lib.SearchRelease(agent_ptr, search_id)
 
+def exact_decide(agent_observation: Observation, deck: list[int], hand_values: list[int],
+                 budget_milliseconds: int) -> dict:
+    """Run actor-relative exact turn search and return action, bounds, and metrics."""
+    global agent_ptr
+    if not hasattr(lib, "ExactDecide"):
+        raise RuntimeError("ExactDecide is not available in this native library")
+    if "agent_ptr" not in globals():
+        agent_ptr = lib.AgentStart()
+    serialized = agent_observation.search_begin_input
+    if serialized is None:
+        raise ValueError("Not agent observation.")
+    if len(deck) != len(hand_values):
+        raise ValueError("deck and hand_values length mismatch")
+    deck_arg = (ctypes.c_int * len(deck))(*deck)
+    value_arg = (ctypes.c_int * len(hand_values))(*hand_values)
+    raw = lib.ExactDecide(agent_ptr, serialized.encode("ascii"), len(serialized),
+                          deck_arg, value_arg, len(deck), int(budget_milliseconds))
+    result = json.loads(raw.decode())
+    if result.get("error"):
+        raise RuntimeError(f"ExactDecide failed: {result['error']}")
+    return result
+
+def exact_load_evaluator_model(path: str) -> dict:
+    """Load a deterministic quantized CPU evaluator used by native leaf search."""
+    global agent_ptr
+    if not hasattr(lib, "ExactLoadEvaluatorModel"):
+        raise RuntimeError("ExactLoadEvaluatorModel is not available in this native library")
+    if "agent_ptr" not in globals():
+        agent_ptr = lib.AgentStart()
+    raw = lib.ExactLoadEvaluatorModel(agent_ptr, str(path).encode("utf-8"))
+    result = json.loads(raw.decode())
+    if not result.get("loaded"):
+        raise RuntimeError(f"Failed to load exact evaluator: {result.get('error', '')}")
+    return result
+
+def exact_unload_evaluator_model() -> None:
+    """Detach the evaluator from future searches; active turn sessions retain it."""
+    global agent_ptr
+    if hasattr(lib, "ExactUnloadEvaluatorModel") and "agent_ptr" in globals():
+        lib.ExactUnloadEvaluatorModel(agent_ptr)
+
+def exact_evaluate_features_v3(global_dense: list[int], global_sparse: list[list[int]],
+                               entities: list[dict]) -> int:
+    """Evaluate a structured native V3 record for bit-exact validation."""
+    global agent_ptr
+    if not hasattr(lib, "ExactEvaluateFeaturesV3"):
+        raise RuntimeError("ExactEvaluateFeaturesV3 is not available")
+    if "agent_ptr" not in globals():
+        agent_ptr = lib.AgentStart()
+    if len(global_dense) != 16 or any(len(item) != 3 for item in global_sparse):
+        raise ValueError("invalid V3 global features")
+    if any(len(entity.get("dense", [])) != 16 or not 0 <= int(entity.get("pool", -1)) < 4
+           or any(len(item) != 3 for item in entity.get("sparse", [])) for entity in entities):
+        raise ValueError("invalid V3 entity features")
+    dense_arg = (ctypes.c_int * len(global_dense))(*global_dense)
+    global_flat = [int(value) for item in global_sparse for value in item]
+    global_arg = (ctypes.c_int * len(global_flat))(*global_flat)
+    entity_dense_flat = [int(value) for entity in entities for value in entity["dense"]]
+    entity_dense_arg = (ctypes.c_int * len(entity_dense_flat))(*entity_dense_flat)
+    pools_arg = (ctypes.c_int * len(entities))(*(int(entity["pool"]) for entity in entities))
+    entity_sparse = [[entity_index, *item] for entity_index, entity in enumerate(entities)
+                     for item in entity.get("sparse", [])]
+    entity_sparse_flat = [int(value) for item in entity_sparse for value in item]
+    entity_sparse_arg = (ctypes.c_int * len(entity_sparse_flat))(*entity_sparse_flat)
+    error = ctypes.c_int()
+    value = lib.ExactEvaluateFeaturesV3(
+        agent_ptr, dense_arg, len(global_dense), global_arg, len(global_sparse),
+        entity_dense_arg, pools_arg, len(entities), entity_sparse_arg, len(entity_sparse),
+        ctypes.byref(error))
+    if error.value:
+        raise RuntimeError(f"native V3 evaluation failed: {error.value}")
+    return int(value)
+
+def exact_evaluate_action(agent_observation: Observation, deck: list[int], hand_values: list[int],
+                          budget_milliseconds: int, option_index: int) -> dict:
+    """Evaluate one root option; intended for deterministic exact-search diagnostics."""
+    global agent_ptr
+    if not hasattr(lib, "ExactEvaluateAction"):
+        raise RuntimeError("ExactEvaluateAction is not available in this native library")
+    if "agent_ptr" not in globals(): agent_ptr = lib.AgentStart()
+    serialized = agent_observation.search_begin_input
+    deck_arg = (ctypes.c_int * len(deck))(*deck)
+    value_arg = (ctypes.c_int * len(hand_values))(*hand_values)
+    raw = lib.ExactEvaluateAction(agent_ptr, serialized.encode("ascii"), len(serialized),
+                                  deck_arg, value_arg, len(deck), int(budget_milliseconds), int(option_index))
+    result = json.loads(raw.decode())
+    if result.get("error"): raise RuntimeError(f"ExactEvaluateAction failed: {result['error']}")
+    return result
+
+def exact_decide_v2(agent_observation: Observation, deck: list[int], hand_values: list[int],
+                    budget_milliseconds: int, opponent_deck: list[int] | None = None) -> dict:
+    """Exact search with an optional known opponent deck for validation runs."""
+    global agent_ptr
+    if not hasattr(lib, "ExactDecideV2"):
+        raise RuntimeError("ExactDecideV2 is not available in this native library")
+    if "agent_ptr" not in globals(): agent_ptr = lib.AgentStart()
+    if len(deck) != len(hand_values): raise ValueError("deck and hand_values length mismatch")
+    serialized = agent_observation.search_begin_input
+    own_arg = (ctypes.c_int * len(deck))(*deck)
+    value_arg = (ctypes.c_int * len(hand_values))(*hand_values)
+    opponent = list(opponent_deck or [])
+    opponent_arg = (ctypes.c_int * len(opponent))(*opponent) if opponent else None
+    raw = lib.ExactDecideV2(agent_ptr, serialized.encode("ascii"), len(serialized),
+                            own_arg, value_arg, len(deck), opponent_arg, len(opponent),
+                            int(budget_milliseconds))
+    result = json.loads(raw.decode())
+    if result.get("error"): raise RuntimeError(f"ExactDecideV2 failed: {result['error']}")
+    return result
+
+def exact_evaluate_action_v2(agent_observation: Observation, deck: list[int], hand_values: list[int],
+                             budget_milliseconds: int, option_index: int,
+                             opponent_deck: list[int] | None = None) -> dict:
+    """Evaluate one root option with an optional closed-world opponent profile."""
+    global agent_ptr
+    if not hasattr(lib, "ExactEvaluateActionV2"):
+        raise RuntimeError("ExactEvaluateActionV2 is not available in this native library")
+    if "agent_ptr" not in globals(): agent_ptr = lib.AgentStart()
+    if len(deck) != len(hand_values): raise ValueError("deck and hand_values length mismatch")
+    serialized = agent_observation.search_begin_input
+    own_arg = (ctypes.c_int * len(deck))(*deck)
+    value_arg = (ctypes.c_int * len(hand_values))(*hand_values)
+    opponent = list(opponent_deck or [])
+    opponent_arg = (ctypes.c_int * len(opponent))(*opponent) if opponent else None
+    raw = lib.ExactEvaluateActionV2(agent_ptr, serialized.encode("ascii"), len(serialized),
+                                    own_arg, value_arg, len(deck), opponent_arg, len(opponent),
+                                    int(budget_milliseconds), int(option_index))
+    result = json.loads(raw.decode())
+    if result.get("error"): raise RuntimeError(f"ExactEvaluateActionV2 failed: {result['error']}")
+    return result
+
+def exact_turn_begin(agent_observation: Observation, deck: list[int], hand_values: list[int],
+                     budget_milliseconds: int, opponent_deck: list[int] | None = None) -> dict:
+    """Start a persistent exact turn policy and return its first action."""
+    global agent_ptr
+    if not hasattr(lib, "ExactTurnBegin"):
+        raise RuntimeError("ExactTurnBegin is not available in this native library")
+    if "agent_ptr" not in globals(): agent_ptr = lib.AgentStart()
+    if len(deck) != len(hand_values): raise ValueError("deck and hand_values length mismatch")
+    serialized = agent_observation.search_begin_input
+    if serialized is None: raise ValueError("Not agent observation.")
+    own_arg = (ctypes.c_int * len(deck))(*deck)
+    value_arg = (ctypes.c_int * len(hand_values))(*hand_values)
+    opponent = list(opponent_deck or [])
+    opponent_arg = (ctypes.c_int * len(opponent))(*opponent) if opponent else None
+    raw = lib.ExactTurnBegin(agent_ptr, serialized.encode("ascii"), len(serialized),
+                             own_arg, value_arg, len(deck), opponent_arg, len(opponent),
+                             int(budget_milliseconds))
+    result = json.loads(raw.decode())
+    if result.get("error"):
+        detail = f": {result['message']}" if result.get("message") else ""
+        raise RuntimeError(f"ExactTurnBegin failed: {result['error']}{detail}")
+    return result
+
+def exact_turn_advance(session_id: int, agent_observation: Observation,
+                       budget_milliseconds: int) -> dict:
+    """Condition and re-root a persistent exact turn policy."""
+    global agent_ptr
+    if not hasattr(lib, "ExactTurnAdvance"):
+        raise RuntimeError("ExactTurnAdvance is not available in this native library")
+    serialized = agent_observation.search_begin_input
+    if serialized is None: raise ValueError("Not agent observation.")
+    raw = lib.ExactTurnAdvance(agent_ptr, int(session_id), serialized.encode("ascii"),
+                               len(serialized), int(budget_milliseconds))
+    result = json.loads(raw.decode())
+    if result.get("error"): raise RuntimeError(f"ExactTurnAdvance failed: {result['error']}")
+    return result
+
+def exact_turn_release(session_id: int) -> None:
+    """Release native memory owned by an exact turn policy."""
+    global agent_ptr
+    if hasattr(lib, "ExactTurnRelease") and "agent_ptr" in globals():
+        lib.ExactTurnRelease(agent_ptr, int(session_id))
+
+def exact_turn_progress(session_id: int) -> dict:
+    """Return non-mutating progress and memory diagnostics for a turn session."""
+    global agent_ptr
+    if not hasattr(lib, "ExactTurnProgress"):
+        raise RuntimeError("ExactTurnProgress is not available in this native library")
+    if "agent_ptr" not in globals():
+        raise RuntimeError("No exact turn session has been started")
+    raw = lib.ExactTurnProgress(agent_ptr, int(session_id))
+    result = json.loads(raw.decode())
+    if result.get("error"): raise RuntimeError(f"ExactTurnProgress failed: {result['error']}")
+    return result
+
 #endregion functions
 

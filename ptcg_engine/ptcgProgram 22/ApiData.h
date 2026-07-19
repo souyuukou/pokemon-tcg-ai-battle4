@@ -8,6 +8,9 @@
 
 #include "BattleData.h"
 #include "Search.h"
+#include <memory>
+
+class ExactCpuEvaluator;
 
 class ApiData : public BattleData {
 public:
@@ -22,4 +25,8 @@ public:
 	BinaryWriter writer;
 	BinaryReader reader;
 	std::vector<std::u8string> visData;
+	std::shared_ptr<ExactCpuEvaluator> exactEvaluator;
+	bool exactReplayTraceEnabled = false;
+	int exactReplayLastTurn = -1;
+	std::vector<std::pair<State, int>> exactReplayTurnLeaves;
 };
