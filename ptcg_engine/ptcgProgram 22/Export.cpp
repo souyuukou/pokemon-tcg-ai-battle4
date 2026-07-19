@@ -1116,15 +1116,8 @@ struct ExactTurnSession {
       if (index < 0 || index >= (int)tasks.size()) return;
       RootTask& task = *tasks[index];
       if (!task.hasBeenVisited) task.score = fresh;
-      else {
-        if (ExactCompare(fresh.lower, task.score.lower) > 0) task.score.lower = fresh.lower;
-        if (ExactCompare(fresh.upper, task.score.upper) < 0) task.score.upper = fresh.upper;
-        if (ExactCompare(task.score.lower, task.score.upper) > 0) task.score = ExactScore{};
-        else task.score.certified = task.score.certified && fresh.certified
-          && ExactCompare(task.score.lower, task.score.upper) == 0;
-        task.score.boundsSound = task.score.boundsSound && fresh.boundsSound;
-        task.score.action = { task.option };
-      }
+      else task.score = mergeSoundBounds(task.score, fresh);
+      task.score.action = { task.option };
       task.intervalWidth = remainingWidth(task.score);
       task.consumedNodes += consumedNodes;
       task.score.action = { task.option };
@@ -1260,7 +1253,8 @@ struct ExactTurnSession {
 			while (std::chrono::steady_clock::now() < absoluteDeadline) {
 				bool pending = false, attempted = false, resourceStopped = false;
 				for (int option : assigned) {
-					if (output->actions[option].certified || structurallyBlocked[option]) continue;
+					if ((output->actions[option].certified && output->actions[option].boundsSound)
+						|| structurallyBlocked[option]) continue;
 					pending = true;
 					auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
 						absoluteDeadline - std::chrono::steady_clock::now()).count();
@@ -1277,13 +1271,8 @@ struct ExactTurnSession {
 						saved = fresh;
 						output->visited[option] = true;
 					}
-					else {
-						if (ExactCompare(fresh.lower, saved.lower) > 0) saved.lower = fresh.lower;
-						if (ExactCompare(fresh.upper, saved.upper) < 0) saved.upper = fresh.upper;
-						saved.certified = saved.certified && fresh.certified
-							&& ExactCompare(saved.lower, saved.upper) == 0;
-						saved.boundsSound = saved.boundsSound && fresh.boundsSound;
-					}
+					else saved = mergeSoundBounds(saved, fresh);
+					saved.action = { option };
 					attempted = true;
 					if (output->planner->resourceStopped()) { resourceStopped = true; break; }
 				}
@@ -1344,24 +1333,14 @@ struct ExactTurnSession {
 			representativeScores.emplace(option, item);
 			representativeWorker[option] = wi;
 		  } else {
-			bool existingCertified = found->second.certified;
-			// Both intervals enclose the same exact value. Their intersection
-			// combines progress made from opposite traversal directions without
-			// sharing mutable partial cursors between workers.
-			if (ExactCompare(item.lower, found->second.lower) > 0) {
-			  found->second.lower = item.lower;
-			  representativeWorker[option] = wi;
-			}
-			if (ExactCompare(item.upper, found->second.upper) < 0)
-			  found->second.upper = item.upper;
-			if (item.certified && !existingCertified) representativeWorker[option] = wi;
-			if (ExactCompare(found->second.lower, found->second.upper) > 0) {
-				found->second = ExactScore{};
-			} else {
-				found->second.certified = existingCertified && item.certified
-					&& ExactCompare(found->second.lower, found->second.upper) == 0;
-				found->second.boundsSound = found->second.boundsSound && item.boundsSound;
-			}
+				// Both intervals enclose the same exact value. Their intersection
+				// combines progress made from opposite traversal directions without
+				// sharing mutable partial cursors between workers.
+				bool preferItem = item.boundsSound
+					&& (!found->second.boundsSound || (item.certified && !found->second.certified));
+				found->second = mergeSoundBounds(found->second, item);
+				found->second.action = { option };
+				if (preferItem) representativeWorker[option] = wi;
 		  }
         }
         MergeExactMetrics(decision.metrics, workers[wi]->planner->currentMetrics());
@@ -1896,17 +1875,9 @@ extern "C" {
         planner.setBudgetMilliseconds((int)std::min<long long>(remaining, 60'000));
         ExactDecision fresh = planner.evaluateRootAction(data->state, optionIndex);
         if (first) { accumulated = fresh; first = false; }
-        else {
-          const bool boundsSound = accumulated.score.boundsSound && fresh.score.boundsSound;
-          const bool valueCertified = accumulated.score.certified && fresh.score.certified;
-          if (ExactCompare(fresh.score.lower, accumulated.score.lower) > 0)
-            accumulated.score.lower = fresh.score.lower;
-          if (ExactCompare(fresh.score.upper, accumulated.score.upper) < 0)
-            accumulated.score.upper = fresh.score.upper;
+		else {
+          accumulated.score = mergeSoundBounds(accumulated.score, fresh.score);
           accumulated.score.action = { optionIndex };
-          accumulated.score.boundsSound = boundsSound;
-          accumulated.score.certified = valueCertified
-            && ExactCompare(accumulated.score.lower, accumulated.score.upper) == 0;
           accumulated.rootActions = fresh.rootActions;
           accumulated.metrics = fresh.metrics;
         }

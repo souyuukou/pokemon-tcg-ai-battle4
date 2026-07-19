@@ -535,6 +535,26 @@ struct ExactScore {
 	bool boundsSound = true;
 };
 
+// Intersect two resumable results without allowing an old timeout to erase a
+// proof that a later slice (or another worker) has already established.  An
+// unsound interval is never used to tighten a sound one.  `certified` is kept
+// monotone in the useful direction: a point interval becomes certified when
+// at least one sound slice supplied a proof, while a later wide slice cannot
+// revoke that proof.
+inline ExactScore mergeSoundBounds(const ExactScore& previous, const ExactScore& fresh) {
+	if (!fresh.boundsSound) return previous;
+	if (!previous.boundsSound) return fresh;
+	ExactScore result = previous;
+	if (ExactCompare(fresh.lower, result.lower) > 0) result.lower = fresh.lower;
+	if (ExactCompare(fresh.upper, result.upper) < 0) result.upper = fresh.upper;
+	if (ExactCompare(result.lower, result.upper) > 0) return ExactScore{};
+	if (!fresh.action.empty()) result.action = fresh.action;
+	result.boundsSound = true;
+	result.certified = (previous.certified || fresh.certified)
+		&& ExactCompare(result.lower, result.upper) == 0;
+	return result;
+}
+
 struct ExactRootActionValue {
 	std::vector<int> action;
 	ExactFraction lower;
@@ -5952,11 +5972,7 @@ private:
 					partialBytes += bytes; partial->accountedBytes += bytes;
 					partial->actionBounds.emplace(actionKey, score);
 				} else {
-					if (ExactCompare(score.lower, found->second.lower) > 0) found->second.lower = score.lower;
-					if (ExactCompare(score.upper, found->second.upper) < 0) found->second.upper = score.upper;
-					found->second.certified = found->second.certified && score.certified
-						&& ExactCompare(found->second.lower, found->second.upper) == 0;
-					found->second.boundsSound = found->second.boundsSound && score.boundsSound;
+					found->second = mergeSoundBounds(found->second, score);
 					score = found->second;
 					metrics.resumedActionCount++;
 				}
