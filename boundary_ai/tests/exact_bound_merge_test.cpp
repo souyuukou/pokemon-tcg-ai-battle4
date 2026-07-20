@@ -34,6 +34,18 @@ void requirePoint(const ExactScore& score, long long value, bool certified) {
 } // namespace
 
 int run() {
+    static_assert(sizeof(GameFunction) == 20,
+        "official deferred-function wire ABI changed");
+    {
+        BinaryReader malformed;
+        malformed.buf = { 0x41, 0x41, 0x41, 0x41 };
+        std::vector<Log> logs;
+        bool rejected = false;
+        try { malformed.set(logs); }
+        catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "oversized binary list was not rejected before allocation");
+    }
+
     // A later exact slice proves an earlier wide, incomplete slice.
     const auto firstLeft = interval(0, 100);
     const auto firstRight = interval(50, 50, true);

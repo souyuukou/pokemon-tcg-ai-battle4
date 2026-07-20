@@ -29,9 +29,9 @@ enum class ArgType : unsigned char {
 };
 
 // The engine ABI stores deferred arguments as ints, but an int can represent
-// very different things.  Keep that meaning beside the deferred frame so the
-// exact canonicalizer never has to guess from a raw value.  Scalar is the
-// conservative default used by legacy pushFunction callers.
+// very different things. Keep that meaning in a function-index side table:
+// GameFunction is serialized as raw bytes by the official runtime and its
+// 20-byte wire layout must never be extended.
 enum class DeferredArgSemantic : unsigned char {
 	None = 0,
 	Scalar,
@@ -65,24 +65,12 @@ struct GameFunction {
 	int arg1 = 0;
 	int arg2 = 0;
 	ArgType argType = ArgType::None; // 引数タイプ
-	DeferredArgSemantic arg0Semantic = DeferredArgSemantic::None;
-	DeferredArgSemantic arg1Semantic = DeferredArgSemantic::None;
-	DeferredArgSemantic arg2Semantic = DeferredArgSemantic::None;
 	unsigned char callCount = 1;
 	unsigned char calledCount = 0;
 
 	GameFunction() = default;
 	GameFunction(void* functionPointer, ArgType argType) : argType(argType) {
 		functionIndex = FunctionIndexTable.at((long long)functionPointer);
-		const DeferredArgSemantic scalar = argType == ArgType::None
-			? DeferredArgSemantic::None : DeferredArgSemantic::Scalar;
-		arg0Semantic = scalar; arg1Semantic = scalar; arg2Semantic = scalar;
-	}
-
-	void setArgumentSemantics(DeferredArgSemantic first,
-		DeferredArgSemantic second = DeferredArgSemantic::None,
-		DeferredArgSemantic third = DeferredArgSemantic::None) {
-		arg0Semantic = first; arg1Semantic = second; arg2Semantic = third;
 	}
 
 	void setCallCount(int callCount) {
@@ -90,8 +78,17 @@ struct GameFunction {
 	}
 };
 
+static_assert(sizeof(GameFunction) == 20,
+	"GameFunction is part of the official raw wire format");
+
 inline DeferredArgSemantics DeferredSemanticsFor(const GameFunction& function) {
 	const auto found = DeferredFunctionSemanticTable().find(function.functionIndex);
 	if (found != DeferredFunctionSemanticTable().end()) return found->second;
-	return { function.arg0Semantic, function.arg1Semantic, function.arg2Semantic };
+	if (function.argType == ArgType::None)
+		return { DeferredArgSemantic::None, DeferredArgSemantic::None,
+			DeferredArgSemantic::None };
+	// An unregistered deferred callback is opaque. Treating its integer
+	// arguments as scalars is an estimate and must not enter exact state keys.
+	return { DeferredArgSemantic::Unknown, DeferredArgSemantic::Unknown,
+		DeferredArgSemantic::Unknown };
 }

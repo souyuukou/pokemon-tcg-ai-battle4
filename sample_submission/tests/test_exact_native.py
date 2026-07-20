@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -27,6 +29,35 @@ import main
 
 
 class NativeExactSmokeTest(unittest.TestCase):
+    def test_opening_nighttime_mine_admission_and_general_value_are_bounded(
+            self) -> None:
+        fixture = Path(
+            __file__).resolve().parent / "fixtures" / "nighttime_mine_opening_main.json"
+        obs = to_observation_class(json.loads(fixture.read_text(encoding="utf-8")))
+        profile = load_profile()
+        deck = list(profile.cards)
+        hand_values = [100] * len(deck)
+        exact_load_general_evaluator_model(str(
+            Path(ROOT, "general-evaluator-v3.bin").resolve()
+        ))
+
+        started = time.monotonic()
+        estimate = exact_estimate_root(obs, deck, hand_values)
+        estimate_elapsed = time.monotonic() - started
+        self.assertLess(estimate_elapsed, 2.0)
+        self.assertTrue(estimate["recommendedGeneral"])
+        self.assertTrue(estimate["largeHiddenOpeningMain"])
+        self.assertEqual([47107, 1], estimate["optionWork"])
+
+        started = time.monotonic()
+        decision = exact_general_decide(obs, deck, hand_values, 1000)
+        general_elapsed = time.monotonic() - started
+        self.assertLess(general_elapsed, 5.0)
+        self.assertTrue(decision["candidateSetComplete"])
+        self.assertTrue(decision["informationSetSafe"])
+        self.assertEqual(2, decision["evaluatedActions"])
+        self.assertIn(decision["selected"], ([0], [1]))
+
     def test_general_model_is_separate_and_scores_one_step_actions(self) -> None:
         profile = load_profile()
         deck = list(profile.cards)

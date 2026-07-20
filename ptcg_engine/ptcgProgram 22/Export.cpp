@@ -2238,14 +2238,27 @@ extern "C" {
     }
     try {
       SetBattleData(data, serialized, count);
-      ExactPlanner probe(deck, handValues, deckCount, 1000, nullptr, 0,
-        nullptr, data->exactEvaluator);
       unsigned long long total = 0, maximum = 0;
       std::vector<unsigned long long> estimates;
       estimates.reserve(data->state.options.size());
+      const int selectedPlayer = data->state.selectPlayer;
+      const unsigned long long rootDeckSize =
+        selectedPlayer >= 0 && selectedPlayer < 2
+        ? (unsigned long long)data->state.players[selectedPlayer].deck.size()
+        : 0ULL;
       for (int option = 0; option < (int)data->state.options.size(); ++option) {
-        unsigned long long estimate = 1;
-        probe.canonicalRootSuccessor(data->state, option, &estimate);
+        // Root admission must be strictly cheaper than the search it guards.
+        // canonicalRootSuccessor() initializes the full hidden-information
+        // state and applies the action; a continuous-effect Stadium in a large
+        // opening deck made that "estimate" consume the entire match clock.
+        // Use only already-materialized public sizes here.
+        const SelectOptionType type = data->state.options[option].type;
+        unsigned long long estimate = type == SelectOptionType::End ? 1ULL
+          : 1ULL + (unsigned long long)data->state.options.size();
+        if (data->state.selectType == SelectType::Main
+            && type != SelectOptionType::End) {
+          estimate += rootDeckSize * 1024ULL;
+        }
         estimates.push_back(estimate);
         maximum = std::max(maximum, estimate);
         if (total > std::numeric_limits<unsigned long long>::max() - estimate)
@@ -2255,9 +2268,12 @@ extern "C" {
       if (workThreshold == 0) workThreshold = 500'000ULL;
       const bool wideEarlyMain = data->state.selectType == SelectType::Main
         && data->state.options.size() > 4
-        && data->state.players[data->state.selectPlayer].deck.size() > 20;
+        && rootDeckSize > 20;
+      const bool largeHiddenOpeningMain = data->state.selectType == SelectType::Main
+        && data->state.turn <= 2
+        && rootDeckSize > 20;
       const bool recommended = maximum >= 1'000'000ULL
-        || total >= workThreshold || wideEarlyMain;
+        || total >= workThreshold || wideEarlyMain || largeHiddenOpeningMain;
       JsonBuilder& j = data->jsonBuilder; j.clear(); j.append('{');
       j.appendKeyValue("error", 0);
       j.appendCommaKey("totalEstimatedWork"); AppendUnsignedLongLong(j, total);
@@ -2265,6 +2281,7 @@ extern "C" {
       j.appendCommaKey("workThreshold"); AppendUnsignedLongLong(j, workThreshold);
       j.appendCommaKeyValue("recommendedGeneral", recommended);
       j.appendCommaKeyValue("wideEarlyMain", wideEarlyMain);
+      j.appendCommaKeyValue("largeHiddenOpeningMain", largeHiddenOpeningMain);
       j.appendCommaKey("optionWork"); j.append('[');
       for (int i = 0; i < (int)estimates.size(); ++i) {
         j.comma(i); AppendUnsignedLongLong(j, estimates[i]);
@@ -2292,18 +2309,10 @@ extern "C" {
         nullptr, 0, nullptr, data->generalEvaluator);
       ExactGeneralDecision decision = planner.evaluateGeneralRoot(
         data->state, std::max<unsigned long long>(1, maximumCandidates));
-      ExactPlanner estimator(deck, handValues, deckCount, 1000,
-        nullptr, 0, nullptr, data->generalEvaluator);
-      for (int option = 0; option < (int)data->state.options.size(); ++option) {
-        unsigned long long estimate = 1;
-        estimator.canonicalRootSuccessor(data->state, option, &estimate);
-        if (decision.estimatedWork
-            > std::numeric_limits<unsigned long long>::max() - estimate) {
-          decision.estimatedWork = std::numeric_limits<unsigned long long>::max();
-          break;
-        }
-        decision.estimatedWork += estimate;
-      }
+      // This is diagnostic only. Never re-enter hidden-state initialization
+      // after the bounded general evaluation just to report an estimate.
+      decision.estimatedWork = std::max<unsigned long long>(
+        decision.estimatedWork, decision.evaluatedActions);
       return ExactGeneralDecisionJson(data, decision);
     } catch (const std::exception& error) {
       return ExactErrorJson(data, 99, error.what());

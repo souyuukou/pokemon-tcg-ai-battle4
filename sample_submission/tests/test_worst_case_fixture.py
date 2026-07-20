@@ -47,17 +47,24 @@ class WorstCaseFixtureTest(unittest.TestCase):
                 obs = to_observation_class(raw)
                 if obs.current.result >= 0:
                     break
-                raw = battle_select(list(range(obs.select.minCount)))
-                obs = to_observation_class(raw)
                 if (obs.current.turn > 0
                         and agent_policy._turn_owner(obs.current) == obs.current.yourIndex):
                     action = main.agent(raw)
                     decision = agent_policy.last_decision
-                    self.assertTrue(action)
+                    self.assertGreaterEqual(len(action), obs.select.minCount)
+                    self.assertLessEqual(len(action), obs.select.maxCount)
+                    self.assertEqual(len(action), len(set(action)))
+                    self.assertTrue(all(
+                        0 <= int(index) < len(obs.select.option)
+                        for index in action
+                    ))
                     exact_diagnostic = decision.get("exactSearch", decision)
                     if int(exact_diagnostic.get("streamingCursorGenerated", 0)) > 0:
                         streaming_decision = exact_diagnostic
                         break
+                    raw = battle_select(action)
+                else:
+                    raw = battle_select(list(range(obs.select.minCount)))
             self.assertIsNotNone(decision)
             self.assertIsNotNone(streaming_decision, "rich fixture never reached streaming draw path")
             decision = streaming_decision

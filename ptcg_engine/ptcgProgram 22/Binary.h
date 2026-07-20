@@ -116,6 +116,9 @@ public:
 	size_t pos = 0;
 
 	void set(void* p, size_t numBytes) {
+		if (pos > buf.size() || numBytes > buf.size() - pos) {
+			throw std::runtime_error("truncated binary state");
+		}
 		auto start = buf.begin() + pos;
 		std::copy(start, start + numBytes, (uint8_t*)p);
 		pos += numBytes;
@@ -127,11 +130,20 @@ public:
 
 	template<typename T>
 	void set(std::vector<T>& list) {
-		list.resize(readInt());
-		set(list.data(), sizeof(T) * list.size());
+		const int count = readInt();
+		if (count < 0) throw std::runtime_error("negative binary list size");
+		const size_t unsignedCount = (size_t)count;
+		if (unsignedCount > (buf.size() - pos) / sizeof(T)) {
+			throw std::runtime_error("binary list exceeds remaining input");
+		}
+		list.resize(unsignedCount);
+		set(list.data(), sizeof(T) * unsignedCount);
 	}
 
 	int readInt() {
+		if (pos > buf.size() || sizeof(int) > buf.size() - pos) {
+			throw std::runtime_error("truncated binary integer");
+		}
 		int v = buf[pos] + (buf[pos + 1] << 8) + (buf[pos + 2] << 16) + (buf[pos + 3] << 24);
 		pos += 4;
 		return v;
@@ -169,6 +181,9 @@ public:
 
 		int padding = 0;
 		int inputCount = (int)base64Dest.size();
+		if (inputCount < 2 || inputCount % 4 != 0) {
+			throw std::runtime_error("invalid base64 state length");
+		}
 
 		if (base64Dest[inputCount - 1] == '=') {
 			padding++;
