@@ -27,6 +27,10 @@ Runtime design:
 - only if both native evaluators are unavailable does the policy fail closed to
   the deterministic legal rule heuristic.
 
+The packaged Linux `cg/libcg.so` is built on Ubuntu 22.04 (GLIBC 2.35) so it
+also loads in the older glibc used by the Kaggle runner. Do not replace it with
+a build from Ubuntu 24.04+, which may require `GLIBC_2.38` or newer.
+
 The default deck is fixed to the battle3 list in
 `sample_submission/sample_submission/deck.csv` and the matching profile under
 `exact_solver/decks/`.
