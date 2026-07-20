@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -61,6 +62,26 @@ def _observation(context, options, *, minimum=1, maximum=1,
 
 
 class AgentPolicyFallbackTest(unittest.TestCase):
+    def test_second_call_survives_agent_directory_leaving_import_path(self) -> None:
+        options = [Option(OptionType.YES), Option(OptionType.NO)]
+        obs = _observation(SelectContext.IS_FIRST, options)
+        original_cwd = os.getcwd()
+        original_path = list(sys.path)
+        try:
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                with patch.dict(sys.modules, {"battle_ai": None}):
+                    sys.path[:] = [
+                        path for path in sys.path
+                        if os.path.abspath(path or original_cwd) != ROOT
+                    ]
+                    try:
+                        os.chdir(temporary_directory)
+                        self.assertEqual([1], agent_policy._fallback_action(obs))
+                    finally:
+                        os.chdir(original_cwd)
+        finally:
+            sys.path[:] = original_path
+
     def test_lone_active_dudunsparce_never_uses_run_away_draw(self) -> None:
         options = [
             Option(OptionType.ABILITY, area=AreaType.ACTIVE, index=0, playerIndex=0),

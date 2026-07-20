@@ -2,8 +2,19 @@
 
 from __future__ import annotations
 import os
+import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
+
+# Kaggle executes main.py with exec() and may change the working directory
+# between calls. Keep modules beside main.py importable for the whole match.
+_AGENT_ROOT = str(Path(__file__).resolve().parents[1])
+if _AGENT_ROOT not in sys.path:
+    sys.path.insert(0, _AGENT_ROOT)
+
+from battle_ai import CardDatabase, option_score
+
 from .canonical import canonical_bytes
 from .profile import load_profile
 from .resources import MatchBudget
@@ -156,7 +167,6 @@ def _fallback_database():
     """Lazily load only public card metadata and replay action priors."""
     global _fallback_cards
     if _fallback_cards is None:
-        from battle_ai import CardDatabase
         _fallback_cards = CardDatabase()
     return _fallback_cards
 
@@ -210,7 +220,6 @@ def _in_play_target(obs, option):
 
 def _fallback_score(obs, option) -> float:
     """Observation-safe tactical ordering when the exact policy is unavailable."""
-    from battle_ai import option_score
     from cg.api import AreaType, EnergyType, OptionType, SelectContext
 
     cards = _fallback_database()
