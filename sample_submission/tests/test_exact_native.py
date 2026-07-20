@@ -6,6 +6,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "sample_submission"))
 sys.path.insert(0, ROOT)
@@ -29,7 +30,7 @@ import main
 
 
 class NativeExactSmokeTest(unittest.TestCase):
-    def test_late_wide_main_avoids_abort_prone_exact_root(self) -> None:
+    def test_late_wide_main_enters_dag_before_measured_exception(self) -> None:
         fixture = Path(
             __file__).resolve().parent / "fixtures" / "late_main_same_area_abort.json"
         raw = json.loads(fixture.read_text(encoding="utf-8"))
@@ -41,12 +42,17 @@ class NativeExactSmokeTest(unittest.TestCase):
         started = time.monotonic()
         estimate = exact_estimate_root(obs, deck, hand_values)
         self.assertLess(time.monotonic() - started, 2.0)
-        self.assertTrue(estimate["recommendedGeneral"])
+        self.assertFalse(estimate["recommendedGeneral"])
         self.assertTrue(estimate["wideMainBranching"])
+        self.assertFalse(estimate["estimatedWorkExceeded"])
 
         agent_policy._default_context.reset()
-        started = time.monotonic()
-        action = main.agent(raw)
+        with patch.dict(
+                os.environ,
+                {"PTCG_EXACT_TURN_MS": "500",
+                 "PTCG_EXACT_SELECTION_MS": "500"}):
+            started = time.monotonic()
+            action = main.agent(raw)
         self.assertLess(time.monotonic() - started, 5.0)
         self.assertGreaterEqual(len(action), obs.select.minCount)
         self.assertLessEqual(len(action), obs.select.maxCount)
@@ -54,6 +60,13 @@ class NativeExactSmokeTest(unittest.TestCase):
         self.assertTrue(all(
             0 <= int(index) < len(obs.select.option) for index in action
         ))
+        self.assertEqual(
+            "general_one_step_value",
+            agent_policy.last_decision.get("decisionMode"),
+        )
+        exact_diagnostic = agent_policy.last_decision.get("exactSearch")
+        self.assertIsNotNone(exact_diagnostic)
+        self.assertGreater(exact_diagnostic["expandedNodes"], 0)
 
         exact_load_evaluator_model(str(
             Path(ROOT, "exact-evaluator-v3.bin").resolve()

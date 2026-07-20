@@ -136,7 +136,6 @@ class PolicyContext:
     last_decision: dict | None = None
     budget_turn: int | None = None
     turn_search_seconds: float = 0.0
-    general_turn: int | None = None
 
     def reset(self) -> None:
         if self.session_id is not None:
@@ -151,7 +150,6 @@ class PolicyContext:
         self.last_decision = None
         self.budget_turn = None
         self.turn_search_seconds = 0.0
-        self.general_turn = None
 
 
 _default_context = PolicyContext(_budget)
@@ -384,19 +382,18 @@ def _fallback_action(obs) -> list[int]:
 def _turn_slice_milliseconds(ctx: PolicyContext, is_new_turn: bool, usable_ms: int,
                              allow_reroot: bool = False) -> int:
     """Return this call's slice while enforcing one absolute per-turn cap."""
-    turn_cap = int(os.environ.get("PTCG_EXACT_TURN_MS", "90000"))
-    selection_cap = int(os.environ.get("PTCG_EXACT_SELECTION_MS", "5000"))
+    turn_cap = int(os.environ.get("PTCG_EXACT_TURN_MS", "20000"))
+    selection_cap = int(os.environ.get("PTCG_EXACT_SELECTION_MS", "2500"))
     remaining_turn_ms = turn_cap - int(ctx.turn_search_seconds * 1000)
     if remaining_turn_ms <= 0:
-        # A retained policy lookup is cheap, but the observed continuation may
-        # be an unfinished branch that was not reached during the root slice.
-        # Give that re-root one normal selection slice instead of 1 ms.  The
-        # process-wide MatchBudget remains the hard 600-second ceiling.
+        # A retained policy lookup is cheap. Keep a one-millisecond probe for
+        # it, but do not silently grant every continuation another full slice
+        # after the absolute per-turn cap has been consumed.
         if allow_reroot:
-            return max(1, min(selection_cap, usable_ms))
+            return 1
         raise RuntimeError("exact turn search budget reached")
     # Small slices make the native root queue resumable and let Python stop as
-    # soon as exact-value certification is reached instead of reserving the
+    # soon as best-action certification is reached instead of reserving the
     # whole turn allowance for a single opaque call.
     return max(1, min(remaining_turn_ms, selection_cap, usable_ms))
 
@@ -408,9 +405,50 @@ def _turn_owner(current) -> int | None:
     return current.firstPlayer if current.turn % 2 == 1 else 1 - current.firstPlayer
 
 
+def _best_action_certified(decision: dict) -> bool:
+    """Whether the returned argmax, rather than its exact value, is proved."""
+    return bool(decision.get(
+        "bestActionCertified", decision.get("certified", False)
+    ))
+
+
+def _exact_value_certified(decision: dict) -> bool:
+    return bool(decision.get(
+        "exactValueCertified", decision.get("certified", False)
+    ))
+
+
+def _native_boundary_dag_usable(decision: dict) -> bool:
+    """Accept a time-limited DAG only after it reached boundary Value.
+
+    A time-limited interval can still provide the documented highest-lower-
+    bound action. Structural gaps, memory stops, contradictions, invalidated
+    sessions, or a search that never called the boundary evaluator are not
+    evidence for choosing that action and must use the general exception model.
+    """
+    return (
+        bool(decision.get("informationSetSafe", False))
+        and bool(decision.get("boundsSound", False))
+        and not bool(decision.get("structurallyBlocked", False))
+        and not bool(decision.get("memoryLimitReached", False))
+        and int(decision.get("boundContradictions", 0)) == 0
+        and int(decision.get("sessionInvalidations", 0)) == 0
+        and int(decision.get("opaqueNodes", 0)) == 0
+        and int(decision.get("interruptedTransitionNodes", 0)) == 0
+        and int(decision.get("unsupportedConcreteReferenceNodes", 0)) == 0
+        and int(decision.get("unknownOpponentListNodes", 0)) == 0
+        and int(decision.get("expandedNodes", 0)) > 0
+        and (
+            int(decision.get("evaluatorCalls", 0))
+            + int(decision.get("evaluatorCacheHits", 0))
+        ) > 0
+        and bool(decision.get("rootActions"))
+    )
+
+
 def choose_action(obs, *, context: PolicyContext | None = None,
                   opponent_deck: list[int] | None = None) -> tuple[list[int], bool, str]:
-    """Return action, certification flag, reason.
+    """Return action, best-action certification flag, reason.
 
     Full turn search is only certified when a transition provider can resolve all
     hidden chance variables. The bundled API demands guessed opponent cards, so
@@ -442,7 +480,7 @@ def choose_action(obs, *, context: PolicyContext | None = None,
 
     # Effects resolved during the opponent's turn can ask this process to choose
     # a promotion, discard, switch target, and similar options.  They are outside
-    # the own-turn planning objective.  Starting a 90-second ExactTurnSession for
+    # the own-turn planning objective. Starting an ExactTurnSession for
     # them consumed most of the match clock in real episodes, so use the
     # observation-safe tactical policy without starting a native session.
     owner = _turn_owner(obs.current)
@@ -465,17 +503,6 @@ def choose_action(obs, *, context: PolicyContext | None = None,
     if select.minCount == select.maxCount == 0: return finish([], True, "forced-empty")
     if select.minCount == select.maxCount == option_count:
         return finish(list(range(option_count)), True, "forced-all")
-    if ctx.general_turn == observed_turn:
-        try:
-            action, general = _general_action(obs, budget_milliseconds=1500)
-            ctx.last_decision = general
-            if context is None:
-                last_decision = general
-            return finish(action, False, "general-explosion-turn-continuation")
-        except Exception:
-            # Continue into exact/fail-closed handling if the optional model has
-            # become unavailable; never fabricate a general result.
-            ctx.general_turn = None
     native_failure = "native exact chance provider unavailable"
     try:
         if not ctx.budget.can_expand():
@@ -488,14 +515,14 @@ def choose_action(obs, *, context: PolicyContext | None = None,
             exact_turn_release,
         )
         _ensure_v3_evaluator()
-        _ensure_general_evaluator()
         profile, hand_values = _profile_inputs()
         is_new_turn = obs.current is not None and obs.current.turn != ctx.last_turn
         usable_ms = max(1, int((ctx.budget.remaining - ctx.budget.limits.reserve_seconds) * 1000))
+        estimate = None
         if is_new_turn:
             estimate = exact_estimate_root(
                 obs, list(profile.cards), hand_values,
-                int(os.environ.get("PTCG_EXACT_WORK_THRESHOLD", "500000")),
+                int(os.environ.get("PTCG_EXACT_WORK_THRESHOLD", "2000000")),
             )
             if bool(estimate.get("recommendedGeneral", False)):
                 if ctx.session_id is not None:
@@ -505,7 +532,6 @@ def choose_action(obs, *, context: PolicyContext | None = None,
                     obs, budget_milliseconds=min(2000, usable_ms))
                 general["rootEstimate"] = estimate
                 ctx.last_turn = obs.current.turn
-                ctx.general_turn = obs.current.turn
                 ctx.last_decision = general
                 if context is None:
                     _last_turn = ctx.last_turn
@@ -513,7 +539,11 @@ def choose_action(obs, *, context: PolicyContext | None = None,
                 return finish(action, False, "general-predicted-explosion")
         requested_ms = _turn_slice_milliseconds(
             ctx, is_new_turn, usable_ms,
-            allow_reroot=ctx.session_id is not None and not is_new_turn,
+            # Even when an unusable branch released the retained session, a
+            # later continuation can be a tiny forced/search selection whose
+            # boundary result is already cheap. Permit the same 1 ms probe
+            # instead of bypassing the DAG solely because the session is gone.
+            allow_reroot=not is_new_turn,
         )
         if is_new_turn:
             if ctx.session_id is not None:
@@ -534,14 +564,13 @@ def choose_action(obs, *, context: PolicyContext | None = None,
             native = exact_decide(obs, list(profile.cards), hand_values, requested_ms)
             reason = "native-exact-turn-search"
 
-        # Continue the same observable root until its exact value and argmax are
-        # certified, or until the explicit turn/match resource ceiling is
-        # reached. ExactTurnAdvance now retains every root task, so these calls
-        # monotonically refine all competing action intervals.
-        turn_cap_ms = int(os.environ.get("PTCG_EXACT_TURN_MS", "90000"))
-        selection_cap_ms = int(os.environ.get("PTCG_EXACT_SELECTION_MS", "5000"))
+        # Continue only until the action is proved. Computing the exact numeric
+        # value after the argmax is already certified cannot change play and
+        # used to consume most of the 600-second match allowance.
+        turn_cap_ms = int(os.environ.get("PTCG_EXACT_TURN_MS", "20000"))
+        selection_cap_ms = int(os.environ.get("PTCG_EXACT_SELECTION_MS", "2500"))
         while (ctx.session_id is not None
-               and not bool(native.get("exactValueCertified", native.get("certified", False)))
+               and not _best_action_certified(native)
                and not bool(native.get("structurallyBlocked", False))
                and not bool(native.get("memoryLimitReached", False))
                and int(native.get("boundContradictions", 0)) == 0
@@ -558,22 +587,37 @@ def choose_action(obs, *, context: PolicyContext | None = None,
                 ctx.session_id, obs,
                 max(1, min(selection_cap_ms, remaining_ms)),
             )
-            reason = ("native-exact-certified"
-                      if native.get("exactValueCertified", native.get("certified", False))
+            reason = ("native-exact-best-action-certified"
+                      if _best_action_certified(native)
                       else "native-exact-resume")
 
         action = [int(index) for index in native["selected"]]
         if select.minCount <= len(action) <= select.maxCount and len(set(action)) == len(action) \
                 and all(0 <= index < option_count for index in action):
+            native.setdefault("decisionMode", "boundary_dag")
+            native["selectionPolicy"] = (
+                "certified_argmax" if _best_action_certified(native)
+                else "highest_sound_lower_bound"
+            )
+            native["usedBoundaryDag"] = True
+            if estimate is not None:
+                native["rootEstimate"] = estimate
             ctx.last_turn = obs.current.turn if obs.current is not None else ctx.last_turn
             ctx.last_decision = native
             if context is None:
                 _last_turn = ctx.last_turn
                 last_decision = native
-            if not bool(native.get("exactValueCertified", native.get("certified", False))):
-                # Exact intervals remain diagnostic evidence, but when their
-                # argmax is still open at the hard time ceiling the dedicated
-                # intermediate-state model is the intended exception policy.
+            best_certified = _best_action_certified(native)
+            if best_certified:
+                reason = ("native-exact-value-certified"
+                          if _exact_value_certified(native)
+                          else "native-exact-best-action-certified")
+                return finish(action, True, reason)
+            if not _native_boundary_dag_usable(native):
+                # No sound boundary-DAG evidence is available for the selected
+                # action. This is the narrow exception path for unsupported
+                # transitions, memory pressure, invariant failures, and roots
+                # that could not reach a turn boundary.
                 try:
                     general_action, general = _general_action(
                         obs, budget_milliseconds=min(1500, max(1, usable_ms)))
@@ -582,18 +626,17 @@ def choose_action(obs, *, context: PolicyContext | None = None,
                         exact_turn_release(ctx.session_id)
                         ctx.session_id = None
                     ctx.last_decision = general
-                    ctx.general_turn = observed_turn
                     if context is None:
                         last_decision = general
                     return finish(general_action, False,
-                                  "general-exact-time-exhausted")
+                                  "general-exact-unusable")
                 except Exception:
-                    reason = "native-exact-budget-exhausted"
-            # If the general model itself is unavailable, preserve the exact
-            # solver's documented highest-lower-bound action and interval.
-            return finish(action, bool(native.get("exactValueCertified",
-                                                   native.get("certified", False))),
-                          reason)
+                    reason = "native-exact-unusable-general-failed"
+            else:
+                # A sound time-limited boundary DAG is preferable to replacing
+                # the whole turn with a one-step intermediate-state estimate.
+                reason = "native-boundary-dag-budget-exhausted"
+            return finish(action, False, reason)
     except Exception as error:
         native_failure = f"{type(error).__name__}: {error}"
     try:

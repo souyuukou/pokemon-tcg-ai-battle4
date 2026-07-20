@@ -2265,7 +2265,7 @@ extern "C" {
           total = std::numeric_limits<unsigned long long>::max();
         else total += estimate;
       }
-      if (workThreshold == 0) workThreshold = 500'000ULL;
+      if (workThreshold == 0) workThreshold = 2'000'000ULL;
       const bool wideEarlyMain = data->state.selectType == SelectType::Main
         && data->state.options.size() > 4
         && rootDeckSize > 20;
@@ -2274,9 +2274,14 @@ extern "C" {
       const bool largeHiddenOpeningMain = data->state.selectType == SelectType::Main
         && data->state.turn <= 2
         && rootDeckSize > 20;
-      const bool recommended = maximum >= 1'000'000ULL
-        || total >= workThreshold || wideMainBranching
-        || largeHiddenOpeningMain;
+      // Branch count is diagnostic, not an admission veto.  The old
+      // `options.size() > 4` rule diverted nearly every real Main selection to
+      // the one-step general evaluator, even when the estimate fit the budget.
+      // Admit those roots to the boundary DAG and reserve the general evaluator
+      // for measured work explosions and the guarded hidden opening.
+      const bool estimatedWorkExceeded =
+        maximum >= workThreshold || total >= workThreshold;
+      const bool recommended = estimatedWorkExceeded || largeHiddenOpeningMain;
       JsonBuilder& j = data->jsonBuilder; j.clear(); j.append('{');
       j.appendKeyValue("error", 0);
       j.appendCommaKey("totalEstimatedWork"); AppendUnsignedLongLong(j, total);
@@ -2286,6 +2291,7 @@ extern "C" {
       j.appendCommaKeyValue("wideEarlyMain", wideEarlyMain);
       j.appendCommaKeyValue("wideMainBranching", wideMainBranching);
       j.appendCommaKeyValue("largeHiddenOpeningMain", largeHiddenOpeningMain);
+      j.appendCommaKeyValue("estimatedWorkExceeded", estimatedWorkExceeded);
       j.appendCommaKey("optionWork"); j.append('[');
       for (int i = 0; i < (int)estimates.size(); ++i) {
         j.comma(i); AppendUnsignedLongLong(j, estimates[i]);

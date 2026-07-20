@@ -12,18 +12,27 @@ Runtime design:
   transitions, and actions are selected only at the common turn boundary;
 - canonical keys omit card serials, logs, and RNG state;
 - per-turn sessions resume across selections and return exact score intervals;
+- search stops once the best action is proved; it does not spend the remaining
+  turn budget proving an exact numeric value that cannot change the move;
 - a cheap native estimate runs at the beginning of each own turn; roots with an
-  immediate multi-draw, a large estimated workload, or a wide Main use
-  the separate general evaluator instead of starting an unlikely-to-finish
-  exhaustive search;
+  estimated workload of at least 2,000,000 units, plus the guarded hidden
+  opening, use the separate general evaluator for that selection. A wide Main
+  is diagnostic only and enters the boundary DAG when its estimate is below
+  the threshold;
 - `exact-evaluator-v3.bin` is trained only on post-checkup turn boundaries;
 - `general-evaluator-v3.bin` is a separate 30 MB information-set-safe network
   trained on every non-setup decision state. It applies each semantic candidate
   once and evaluates the resulting intermediate state. Its ranking includes a
   bounded observation-safe tactical term for forcing short sequences;
 - the general evaluator also handles unresolved own choices during the
-  opponent's turn and replaces an uncertified exact argmax at the hard time
-  ceiling. It never reports exact certification;
+  opponent's turn and replaces a DAG result only when the search encounters an
+  opaque/unsupported transition, a bound contradiction, session invalidation,
+  memory pressure, or never reaches the boundary evaluator. A time-limited
+  sound DAG keeps its highest-lower-bound action. General mode is not sticky:
+  the next observed selection attempts the boundary DAG again;
+- the default exact allowance is 20 seconds per own turn in 2.5-second slices.
+  After that cap, continuations receive only a 1 ms policy/DAG probe so the
+  600-second match budget cannot be consumed by repeated re-root slices;
 - only if both native evaluators are unavailable does the policy fail closed to
   the deterministic legal rule heuristic.
 

@@ -143,14 +143,14 @@ class AgentPolicyFallbackTest(unittest.TestCase):
         obs = _observation(SelectContext.IS_FIRST, options)
         self.assertEqual([1], agent_policy._fallback_action(obs))
 
-    def test_spent_turn_budget_reserves_a_reroot_selection_slice(self) -> None:
+    def test_spent_turn_budget_allows_only_a_policy_lookup_probe(self) -> None:
         context = agent_policy.PolicyContext()
         context.turn_search_seconds = 10.0
         old = os.environ.get("PTCG_EXACT_TURN_MS")
         os.environ["PTCG_EXACT_TURN_MS"] = "1"
         try:
             self.assertEqual(
-                100,
+                1,
                 agent_policy._turn_slice_milliseconds(
                     context, False, 100, allow_reroot=True
                 ),
@@ -165,7 +165,7 @@ class AgentPolicyFallbackTest(unittest.TestCase):
             else:
                 os.environ["PTCG_EXACT_TURN_MS"] = old
 
-    def test_unproven_native_root_action_uses_general_time_fallback(self) -> None:
+    def test_unusable_native_root_action_uses_general_exception(self) -> None:
         hand = [Card(741, 1, 0)]
         options = [
             Option(OptionType.END),
@@ -203,11 +203,82 @@ class AgentPolicyFallbackTest(unittest.TestCase):
                 )
             self.assertEqual([1], action)
             self.assertFalse(certified)
-            self.assertEqual("general-exact-time-exhausted", reason)
+            self.assertEqual("general-exact-unusable", reason)
         finally:
             # The native begin call was mocked, so there is no real session to
             # release from the global engine registry.
             context.session_id = None
+
+    def test_best_action_proof_does_not_wait_for_exact_value(self) -> None:
+        hand = [Card(741, 1, 0)]
+        options = [
+            Option(OptionType.END),
+            Option(OptionType.PLAY, index=0),
+        ]
+        obs = _observation(
+            SelectContext.MAIN,
+            options,
+            active=[_pokemon(305)],
+            hand=hand,
+        )
+        obs.current.turn = 1
+        obs.current.firstPlayer = 0
+        context = agent_policy.PolicyContext()
+        native = {
+            "selected": [0],
+            "certified": False,
+            "bestActionCertified": True,
+            "exactValueCertified": False,
+            "informationSetSafe": True,
+            "boundsSound": True,
+            "memoryLimitReached": False,
+            "structurallyBlocked": False,
+            "boundContradictions": 0,
+            "sessionInvalidations": 0,
+            "expandedNodes": 10,
+            "evaluatorCalls": 2,
+            "rootActions": [{"selected": [0]}, {"selected": [1]}],
+            "sessionId": 99,
+        }
+        try:
+            with patch.object(agent_policy, "_ensure_v3_evaluator"), \
+                    patch.object(agent_policy, "_profile_inputs",
+                                 return_value=(
+                                     SimpleNamespace(cards=[741] * 60),
+                                     [100] * 60,
+                                 )), \
+                    patch.object(cg.api, "exact_estimate_root",
+                                 return_value={"recommendedGeneral": False}), \
+                    patch.object(cg.api, "exact_turn_begin",
+                                 return_value=native), \
+                    patch.object(agent_policy, "_general_action") as general:
+                action, certified, reason = agent_policy.choose_action(
+                    obs, context=context
+                )
+            self.assertEqual([0], action)
+            self.assertTrue(certified)
+            self.assertEqual("native-exact-best-action-certified", reason)
+            self.assertEqual("boundary_dag", context.last_decision["decisionMode"])
+            general.assert_not_called()
+        finally:
+            context.session_id = None
+
+    def test_safe_time_limited_boundary_dag_is_not_replaced_by_general(self) -> None:
+        decision = {
+            "informationSetSafe": True,
+            "boundsSound": True,
+            "structurallyBlocked": False,
+            "memoryLimitReached": False,
+            "boundContradictions": 0,
+            "sessionInvalidations": 0,
+            "expandedNodes": 200,
+            "evaluatorCalls": 7,
+            "evaluatorCacheHits": 3,
+            "rootActions": [{"selected": [0]}, {"selected": [1]}],
+        }
+        self.assertTrue(agent_policy._native_boundary_dag_usable(decision))
+        decision["opaqueNodes"] = 1
+        self.assertFalse(agent_policy._native_boundary_dag_usable(decision))
 
     def test_predicted_explosion_uses_general_one_step_value(self) -> None:
         options = [Option(OptionType.END), Option(OptionType.PLAY, index=0)]
@@ -242,6 +313,62 @@ class AgentPolicyFallbackTest(unittest.TestCase):
         self.assertEqual("general-predicted-explosion", reason)
         self.assertIs(general, context.last_decision)
         exact_begin.assert_not_called()
+
+    def test_predicted_explosion_is_not_sticky_for_the_whole_turn(self) -> None:
+        options = [Option(OptionType.END), Option(OptionType.PLAY, index=0)]
+        obs = _observation(
+            SelectContext.MAIN, options,
+            active=[_pokemon(305)], hand=[Card(741, 1, 0)])
+        obs.current.turn = 3
+        obs.current.firstPlayer = 0
+        context = agent_policy.PolicyContext()
+        general = {
+            "selected": [1],
+            "informationSetSafe": True,
+            "candidateSetComplete": True,
+        }
+        native = {
+            "selected": [0],
+            "certified": False,
+            "bestActionCertified": True,
+            "exactValueCertified": False,
+            "informationSetSafe": True,
+            "boundsSound": True,
+            "memoryLimitReached": False,
+            "structurallyBlocked": False,
+            "boundContradictions": 0,
+            "sessionInvalidations": 0,
+            "expandedNodes": 5,
+            "evaluatorCalls": 1,
+            "rootActions": [{"selected": [0]}, {"selected": [1]}],
+        }
+        with patch.object(agent_policy, "_ensure_v3_evaluator"), \
+                patch.object(agent_policy, "_profile_inputs",
+                             return_value=(
+                                 SimpleNamespace(cards=[741] * 60),
+                                 [100] * 60,
+                             )), \
+                patch.object(cg.api, "exact_estimate_root",
+                             return_value={"recommendedGeneral": True}) as estimate, \
+                patch.object(agent_policy, "_general_action",
+                             return_value=([1], general)) as general_action, \
+                patch.object(cg.api, "exact_decide",
+                             return_value=native) as exact:
+            first, first_certified, first_reason = agent_policy.choose_action(
+                obs, context=context
+            )
+            second, second_certified, second_reason = agent_policy.choose_action(
+                obs, context=context
+            )
+        self.assertEqual([1], first)
+        self.assertFalse(first_certified)
+        self.assertEqual("general-predicted-explosion", first_reason)
+        self.assertEqual([0], second)
+        self.assertTrue(second_certified)
+        self.assertEqual("native-exact-best-action-certified", second_reason)
+        estimate.assert_called_once()
+        general_action.assert_called_once()
+        exact.assert_called_once()
 
     def test_opponent_turn_selection_uses_general_value(self) -> None:
         obs = _observation(
