@@ -1,0 +1,24 @@
+{
+  "sourceRange": "2026-06-16 through 2026-07-19",
+  "officialKaggleDailyZips": "2026-07-03 through 2026-07-19",
+  "candidateReplays": 178025,
+  "acceptedReplays": 21448,
+  "rejectedReplays": 156577,
+  "examples": 2720815,
+  "boundaryExamples": 253721,
+  "intermediateExamples": 2467094,
+  "epochs": 5,
+  "streamingTraining": true,
+  "informationSetSafe": true,
+  "boundaryCandidate": {
+    "quantizedMse": 0.9070120811158022,
+    "initialQuantizedMse": 0.8051136289512967,
+    "promoted": false
+  },
+  "generalCandidate": {
+    "quantizedMse": 0.9285052267819405,
+    "initialQuantizedMse": 0.9312282171587325,
+    "promoted": true,
+    "sha256": "bb126eb5a94ae14e1fb7ade3e5e1e720d502fc1f92744bce681cedb3cb0676f6"
+  }
+}

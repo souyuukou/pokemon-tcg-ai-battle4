@@ -51,23 +51,33 @@ class Example:
     weight: float
 
 
+def _example(raw: dict) -> Example | None:
+    if raw.get("overflow"):
+        return None
+    return Example(
+        str(raw["date"]), str(raw["replayId"]),
+        raw["globalDense"], raw["globalSparse"], raw["entities"],
+        float(raw["reward"]), float(raw["matchWeight"]),
+    )
+
+
 def read_examples(path: Path, sample_kind: str | None) -> list[Example]:
-    result = []
+    """Compatibility helper for small tests; training uses the streaming path."""
+    result = list(iter_examples(path, sample_kind))
+    if not result:
+        raise ValueError("dataset has no non-overflow examples")
+    return result
+
+
+def iter_examples(path: Path, sample_kind: str | None):
     with path.open(encoding="utf-8") as stream:
         for line in stream:
             raw = json.loads(line)
             if sample_kind is not None and raw.get("sampleKind") != sample_kind:
                 continue
-            if raw.get("overflow"):
-                continue
-            result.append(Example(
-                str(raw["date"]), str(raw["replayId"]),
-                raw["globalDense"], raw["globalSparse"], raw["entities"],
-                float(raw["reward"]), float(raw["matchWeight"]),
-            ))
-    if not result:
-        raise ValueError("dataset has no non-overflow examples")
-    return result
+            item = _example(raw)
+            if item is not None:
+                yield item
 
 
 def split_matches(examples: list[Example]):
@@ -93,6 +103,37 @@ class ReplayDataset(Dataset):
 
     def __getitem__(self, index):
         return self.examples[index]
+
+
+def split_key(date: str, replay: str) -> int:
+    # Hash splitting avoids retaining millions of JSON examples in RAM while
+    # keeping every prefix of one match in the same partition.
+    value = hashlib.blake2b(f"{date}\0{replay}".encode(), digest_size=2).digest()
+    bucket = int.from_bytes(value, "big") % 10
+    return 0 if bucket < 8 else (1 if bucket == 8 else 2)
+
+
+def iter_split_batches(path: Path, sample_kind: str | None,
+                       split: int, batch_size: int):
+    batch: list[Example] = []
+    for item in iter_examples(path, sample_kind):
+        if split_key(item.date, item.replay) != split:
+            continue
+        batch.append(item)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def count_split_examples(path: Path, sample_kind: str | None):
+    counts = [0, 0, 0]
+    for item in iter_examples(path, sample_kind):
+        counts[split_key(item.date, item.replay)] += 1
+    if not any(counts):
+        raise ValueError("dataset has no non-overflow examples")
+    return counts
 
 
 def collate(examples: list[Example], token_index: dict[int, int]):
@@ -253,6 +294,19 @@ def metrics(network, loader, device):
             "signAccuracy": correct / max(count, 1)}
 
 
+def stream_metrics(network, batches, device, token_index):
+    return metrics(network,
+                   (collate(batch, token_index) for batch in batches), device)
+
+
+def dataset_digest(path: Path) -> bytes:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.digest()
+
+
 def to_feature(example: Example) -> FeatureRecord:
     return FeatureRecord(
         example.dense,
@@ -276,18 +330,11 @@ def main():
     args = parser.parse_args()
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
-    examples = read_examples(args.dataset, args.sample_kind)
     if args.boundary_only != (args.sample_kind == "boundary"):
         raise ValueError("--boundary-only must be set exactly for boundary samples")
-    train, validation, test = split_matches(examples)
+    split_counts = count_split_examples(args.dataset, args.sample_kind)
     base = load_quantized(args.initial_model)
     token_index = {int(token): index for index, token in enumerate(base.tokens)}
-    collator = lambda values: collate(values, token_index)
-    loaders = [
-        DataLoader(ReplayDataset(values), batch_size=args.batch_size,
-                   shuffle=index == 0, collate_fn=collator, num_workers=0)
-        for index, values in enumerate((train, validation, test))
-    ]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     network = V3Network(base).to(device)
     optimizer = torch.optim.AdamW(network.parameters(), lr=args.learning_rate,
@@ -295,7 +342,9 @@ def main():
     best_state = None; best_epoch = 0; best_validation = math.inf; history = []
     for epoch in range(1, args.epochs + 1):
         network.train()
-        for batch in loaders[0]:
+        for examples in iter_split_batches(args.dataset, args.sample_kind, 0,
+                                           args.batch_size):
+            batch = collate(examples, token_index)
             optimizer.zero_grad(set_to_none=True)
             prediction = network(batch)
             target = batch["target"].to(device)
@@ -304,7 +353,10 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(network.parameters(), 5.0)
             optimizer.step()
-        validation_metrics = metrics(network, loaders[1], device)
+        validation_metrics = stream_metrics(
+            network,
+            iter_split_batches(args.dataset, args.sample_kind, 1, args.batch_size),
+            device, token_index)
         history.append({"epoch": epoch, **validation_metrics})
         print(f"epoch={epoch} validation={validation_metrics}", flush=True)
         if validation_metrics["mse"] < best_validation:
@@ -315,23 +367,34 @@ def main():
                 for key, value in network.state_dict().items()
             }
     network.load_state_dict(best_state)
-    dataset_hash = hashlib.sha256(args.dataset.read_bytes()).digest()
+    dataset_hash = dataset_digest(args.dataset)
     model = quantize(network, base, dataset_hash)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     export_quantized(args.output, model, boundary_only=args.boundary_only)
-    float_test = metrics(network, loaders[2], device)
-    quantized_predictions = np.asarray(predict_integer_many(
-        model, [to_feature(example) for example in test]), dtype=np.float64) / 100_000_000
-    baseline_predictions = np.asarray(predict_integer_many(
-        base, [to_feature(example) for example in test]), dtype=np.float64) / 100_000_000
-    targets = np.asarray([example.target for example in test])
-    weights = np.asarray([example.weight for example in test])
-    quantized_mse = float(np.sum((quantized_predictions - targets) ** 2 * weights)
-                          / np.sum(weights))
-    quantized_sign = float(np.mean((quantized_predictions >= 0) == (targets >= 0)))
-    baseline_mse = float(np.sum((baseline_predictions - targets) ** 2 * weights)
-                         / np.sum(weights))
-    baseline_sign = float(np.mean((baseline_predictions >= 0) == (targets >= 0)))
+    float_test = stream_metrics(
+        network,
+        iter_split_batches(args.dataset, args.sample_kind, 2, args.batch_size),
+        device, token_index)
+    quantized_squared = quantized_weighted = baseline_squared = 0.0
+    quantized_correct = baseline_correct = quantized_count = 0
+    for examples in iter_split_batches(args.dataset, args.sample_kind, 2,
+                                       args.batch_size):
+        quantized_predictions = np.asarray(predict_integer_many(
+            model, [to_feature(example) for example in examples]), dtype=np.float64) / 100_000_000
+        baseline_predictions = np.asarray(predict_integer_many(
+            base, [to_feature(example) for example in examples]), dtype=np.float64) / 100_000_000
+        targets = np.asarray([example.target for example in examples])
+        weights = np.asarray([example.weight for example in examples])
+        quantized_squared += float(np.sum((quantized_predictions - targets) ** 2 * weights))
+        baseline_squared += float(np.sum((baseline_predictions - targets) ** 2 * weights))
+        quantized_weighted += float(np.sum(weights))
+        quantized_correct += int(np.sum((quantized_predictions >= 0) == (targets >= 0)))
+        baseline_correct += int(np.sum((baseline_predictions >= 0) == (targets >= 0)))
+        quantized_count += len(examples)
+    quantized_mse = quantized_squared / max(quantized_weighted, 1e-12)
+    quantized_sign = quantized_correct / max(quantized_count, 1)
+    baseline_mse = baseline_squared / max(quantized_weighted, 1e-12)
+    baseline_sign = baseline_correct / max(quantized_count, 1)
     report = {
         "dataset": str(args.dataset.resolve()),
         "datasetSha256": dataset_hash.hex(),
@@ -342,9 +405,10 @@ def main():
         "device": str(device),
         "epochs": args.epochs,
         "bestEpoch": best_epoch,
-        "examples": len(examples),
+        "examples": sum(split_counts),
         "splitExamples": {
-            "train": len(train), "validation": len(validation), "test": len(test)},
+            "train": split_counts[0], "validation": split_counts[1],
+            "test": split_counts[2]},
         "validationHistory": history,
         "floatTest": float_test,
         "quantizedTest": {

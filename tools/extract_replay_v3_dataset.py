@@ -12,6 +12,8 @@ import hashlib
 import json
 import os
 import sys
+import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -38,13 +40,61 @@ def card_ids(cards) -> list[int]:
     return [int(card["id"]) for card in cards or ()]
 
 
-def replay_paths(source: Path, candidate_limit: int) -> list[Path]:
-    paths = [
-        path for path in source.rglob("*.json")
-        if path.is_file() and not any(part.startswith("_") for part in path.parts)
-    ]
+@dataclass(frozen=True)
+class ReplaySource:
+    container: Path
+    member: str | None
+    date: str
+    replay_id: str
+
+    def read_text(self) -> str:
+        if self.member is None:
+            return self.container.read_text(encoding="utf-8")
+        archive = _zip_cache.get(self.container)
+        if archive is None:
+            archive = zipfile.ZipFile(self.container)
+            _zip_cache[self.container] = archive
+        with archive.open(self.member) as stream:
+            return stream.read().decode("utf-8")
+
+
+_zip_cache: dict[Path, zipfile.ZipFile] = {}
+
+
+def replay_paths(source: Path, candidate_limit: int) -> list[ReplaySource]:
+    paths: list[ReplaySource] = []
+    for path in source.rglob("*"):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        if any(part.startswith("_") for part in path.parts):
+            continue
+        if path.suffix.lower() == ".json":
+            paths.append(ReplaySource(path, None, path.parent.name, path.stem))
+        elif path.suffix.lower() == ".zip":
+            try:
+                with zipfile.ZipFile(path) as archive:
+                    for member in archive.namelist():
+                        member_path = Path(member)
+                        if (member_path.suffix.lower() == ".json"
+                                and not member_path.name.startswith(".")):
+                            paths.append(ReplaySource(
+                                path, member, path.parent.name, member_path.stem))
+            except (OSError, zipfile.BadZipFile):
+                continue
+    zip_dates = {
+        path.date for path in paths if path.container.suffix.lower() == ".zip"
+    }
+    if zip_dates:
+        paths = [
+            path for path in paths
+            if path.date not in zip_dates
+            or path.container.suffix.lower() == ".zip"
+        ]
     # Stable chronological split is preserved by the path layout and replay id.
-    paths.sort(key=lambda path: (path.parent.name, int(path.stem)))
+    paths.sort(key=lambda path: (
+        path.date,
+        int(path.replay_id) if path.replay_id.isdigit() else path.replay_id,
+    ))
     if candidate_limit > 0 and len(paths) > candidate_limit:
         # Cover the entire available time span rather than taking only the oldest
         # agent population.
@@ -56,10 +106,10 @@ def replay_paths(source: Path, candidate_limit: int) -> list[Path]:
     return paths
 
 
-def extract_one(path: Path, mode: str) -> tuple[list[dict], str | None]:
+def extract_one(path: ReplaySource, mode: str) -> tuple[list[dict], str | None]:
     battle_open = False
     try:
-        replay = json.loads(path.read_text(encoding="utf-8"))
+        replay = json.loads(path.read_text())
         rewards = replay.get("rewards")
         if (not isinstance(rewards, list) or len(rewards) != 2
                 or not all(isinstance(value, (int, float)) for value in rewards)):
@@ -121,7 +171,7 @@ def extract_one(path: Path, mode: str) -> tuple[list[dict], str | None]:
         samples = exact_replay_trace_drain()
         if not samples:
             return [], "empty_trace"
-        replay_id = str(replay.get("id", path.stem))
+        replay_id = str(replay.get("id", path.replay_id))
         kind_counts = {
             kind: sum(sample.get("sampleKind") == kind for sample in samples)
             for kind in ("boundary", "intermediate")
@@ -132,7 +182,7 @@ def extract_one(path: Path, mode: str) -> tuple[list[dict], str | None]:
             sample["matchWeight"] = 1.0 / max(
                 1, kind_counts.get(sample.get("sampleKind"), 0))
             sample["replayId"] = replay_id
-            sample["date"] = path.parent.name
+            sample["date"] = path.date
             sample["sampleIndex"] = index
         return samples, None
     except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
@@ -160,9 +210,19 @@ def main() -> None:
     parser.add_argument("--max-replays", type=int, default=15000,
                         help="maximum candidates examined to reach --limit")
     parser.add_argument("--progress-every", type=int, default=50)
+    parser.add_argument("--date-from", default="",
+                        help="inclusive YYYY-MM-DD source date filter")
+    parser.add_argument("--date-to", default="",
+                        help="inclusive YYYY-MM-DD source date filter")
     args = parser.parse_args()
 
     selected = replay_paths(args.source, args.max_replays)
+    if args.date_from or args.date_to:
+        selected = [
+            path for path in selected
+            if (not args.date_from or path.date >= args.date_from)
+            and (not args.date_to or path.date <= args.date_to)
+        ]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")
     accepted = rejected = examples = 0
@@ -181,7 +241,7 @@ def main() -> None:
                     line = json.dumps(sample, ensure_ascii=False, separators=(",", ":"))
                     stream.write(line + "\n")
                     digest.update((line + "\n").encode("utf-8"))
-                if accepted >= args.limit:
+                if args.limit > 0 and accepted >= args.limit:
                     break
             if index % args.progress_every == 0:
                 print(

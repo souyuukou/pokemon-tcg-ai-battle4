@@ -39,15 +39,20 @@ policy, not an exact boundary result. Runtime concurrency remains under the
 process-wide two-thread permit budget, and the two resident V3 models require
 well below the 3 GB limit.
 
-The checked-in 2026-07-20 training run accepted 500 fully reproducible matches
-and rejected 4,655 complete matches rather than retaining mismatched prefixes.
-It produced 5,215 boundary and 46,999 intermediate examples. On their separate
-latest-match test splits:
+The latest all-day run used the 178,025 replay candidates from 2026-06-16
+through 2026-07-19 (including the official Kaggle daily ZIPs for 2026-07-03
+through 2026-07-19). It accepted 21,448 complete matches and rejected 156,577
+without retaining mismatched prefixes, producing 253,721 boundary and
+2,467,094 intermediate examples. Training is streamed to keep the resident
+working set below the 3 GB runtime budget.
 
-- retrained boundary V3: quantized MSE 0.7017 and sign accuracy 0.7150
-  (initial model: 0.9916 and 0.5953);
-- general V3: quantized MSE 0.8116 and sign accuracy 0.6469
-  (boundary initialization on intermediate states: 0.9090 and 0.6433).
+The boundary candidate's float network improved (test MSE 0.6321), but its
+quantized export regressed to MSE 0.9070 versus the deployed baseline 0.8051;
+the production boundary file therefore remains the last quantized model that
+passed the regression gate. The new general V3 export passed the gate: its
+quantized test MSE is 0.9285 versus 0.9312 for its boundary-initialized input,
+with sign accuracy 0.6277 versus 0.6341. Both candidate artifacts and their
+reports remain in `data/` for further quantization-aware tuning.
 
 In the final fixed-deck benchmark, the general exception policy played the
 legacy emergency heuristic on both seats for seeds 1–50. All 100 games

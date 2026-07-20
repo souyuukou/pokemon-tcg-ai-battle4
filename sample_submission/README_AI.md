@@ -48,19 +48,21 @@ from 10,000 replay JSON files with Laplace-smoothed action frequencies.  The
 learner is streaming: it keeps only one replay and compact counters in memory,
 so it remains suitable for the 3 GB runtime limit.
 
-Retrain both Value models from complete, exactly replayable matches:
+Retrain both Value models from complete, exactly replayable matches. The
+official daily Kaggle ZIPs are consumed directly (no multi-gigabyte unzip
+tree), and the trainer streams examples instead of retaining the full JSONL:
 
 ```powershell
 python tools/extract_replay_v3_dataset.py data/kaggle_replays data/train-v3-both.jsonl `
-  --mode both --limit 500 --max-replays 6000
+  --mode both --limit 0 --max-replays 0
 python tools/train_v3_evaluator.py data/train-v3-both.jsonl `
   sample_submission/sample_submission/exact-evaluator-v3.bin `
   --initial-model sample_submission/sample_submission/exact-evaluator-v3.bin `
-  --sample-kind boundary --boundary-only --epochs 20
+  --sample-kind boundary --boundary-only --epochs 5
 python tools/train_v3_evaluator.py data/train-v3-both.jsonl `
   sample_submission/sample_submission/general-evaluator-v3.bin `
   --initial-model sample_submission/sample_submission/exact-evaluator-v3.bin `
-  --sample-kind intermediate --epochs 20
+  --sample-kind intermediate --epochs 5
 ```
 
 Each replay contributes total loss weight one independently to each dataset.
@@ -76,5 +78,10 @@ python tools/evaluate_general_selfplay.py --seed-count 50 `
   --output data/general-vs-heuristic.json
 ```
 
-The checked-in training run's final verification completed all 100 games,
-winning 57–43 with 258,084,864 peak RSS.
+The latest all-day extraction (2026-06-16 through 2026-07-19) accepted 21,448
+matches and produced 2,720,815 examples. The general export was promoted after
+its quantized regression check; the newly trained boundary candidate is kept in
+`data/` but is not promoted because quantization regressed its held-out MSE.
+The 20-game both-seat verification completed all games, with the general
+policy winning 12–8 against the emergency heuristic and peak RSS 242,302,976
+bytes.
