@@ -58,6 +58,23 @@ jobs:
         run: cmake --build build/ci-release --target ptcg_exact_bound_merge_test --verbose --parallel 2
       - name: Test
         run: ctest --test-dir build/ci-release --output-on-failure
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Python regression dependency
+        run: python -m pip install --disable-pip-version-check --no-input numpy
+      - name: Build native submission shared object
+        working-directory: ptcg_engine/ptcgProgram 22
+        run: >-
+          g++ -std=c++20 -O2 -DNDEBUG -fPIC -shared -pthread -I.
+          Export.cpp ExactEvaluatorAvx2.cpp
+          -o ../../sample_submission/sample_submission/cg/libcg.so
+      - name: Run Linux native regression tests
+        run: >-
+          python -m unittest
+          sample_submission.tests.test_exact_native
+          sample_submission.tests.test_worst_case_fixture
+          sample_submission.tests.test_v4_identity_oracle
 
   windows-msvc:
     runs-on: windows-latest

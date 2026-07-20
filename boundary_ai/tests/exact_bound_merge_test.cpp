@@ -37,6 +37,22 @@ int run() {
     static_assert(sizeof(GameFunction) == 20,
         "official deferred-function wire ABI changed");
     {
+        State state;
+        state.exact.enabled = true;
+        state.players[0].hand.push_back(CardRef(1));
+        CardRef unchanged = MoveCard(
+            state, 0, AreaType::Hand, 0, AreaType::Hand);
+        require(unchanged == CardRef(1),
+            "same-area exact move did not preserve the referenced card");
+        require(state.players[0].hand.size() == 1
+                && state.players[0].hand[0] == CardRef(1),
+            "same-area exact move mutated the source zone");
+        require(state.exact.pending == ExactPendingType::Opaque
+                && state.exact.blockReason
+                    == ExactBlockReason::InterruptedTransition,
+            "same-area exact move did not fail closed");
+    }
+    {
         BinaryReader malformed;
         malformed.buf = { 0x41, 0x41, 0x41, 0x41 };
         std::vector<Log> logs;

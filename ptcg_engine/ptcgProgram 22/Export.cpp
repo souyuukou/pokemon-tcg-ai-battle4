@@ -2269,11 +2269,14 @@ extern "C" {
       const bool wideEarlyMain = data->state.selectType == SelectType::Main
         && data->state.options.size() > 4
         && rootDeckSize > 20;
+      const bool wideMainBranching = data->state.selectType == SelectType::Main
+        && data->state.options.size() > 4;
       const bool largeHiddenOpeningMain = data->state.selectType == SelectType::Main
         && data->state.turn <= 2
         && rootDeckSize > 20;
       const bool recommended = maximum >= 1'000'000ULL
-        || total >= workThreshold || wideEarlyMain || largeHiddenOpeningMain;
+        || total >= workThreshold || wideMainBranching
+        || largeHiddenOpeningMain;
       JsonBuilder& j = data->jsonBuilder; j.clear(); j.append('{');
       j.appendKeyValue("error", 0);
       j.appendCommaKey("totalEstimatedWork"); AppendUnsignedLongLong(j, total);
@@ -2281,6 +2284,7 @@ extern "C" {
       j.appendCommaKey("workThreshold"); AppendUnsignedLongLong(j, workThreshold);
       j.appendCommaKeyValue("recommendedGeneral", recommended);
       j.appendCommaKeyValue("wideEarlyMain", wideEarlyMain);
+      j.appendCommaKeyValue("wideMainBranching", wideMainBranching);
       j.appendCommaKeyValue("largeHiddenOpeningMain", largeHiddenOpeningMain);
       j.appendCommaKey("optionWork"); j.append('[');
       for (int i = 0; i < (int)estimates.size(); ++i) {

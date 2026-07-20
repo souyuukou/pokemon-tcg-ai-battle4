@@ -29,6 +29,43 @@ import main
 
 
 class NativeExactSmokeTest(unittest.TestCase):
+    def test_late_wide_main_avoids_abort_prone_exact_root(self) -> None:
+        fixture = Path(
+            __file__).resolve().parent / "fixtures" / "late_main_same_area_abort.json"
+        raw = json.loads(fixture.read_text(encoding="utf-8"))
+        obs = to_observation_class(raw)
+        profile = load_profile()
+        deck = list(profile.cards)
+        hand_values = [100] * len(deck)
+
+        started = time.monotonic()
+        estimate = exact_estimate_root(obs, deck, hand_values)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertTrue(estimate["recommendedGeneral"])
+        self.assertTrue(estimate["wideMainBranching"])
+
+        agent_policy._default_context.reset()
+        started = time.monotonic()
+        action = main.agent(raw)
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertGreaterEqual(len(action), obs.select.minCount)
+        self.assertLessEqual(len(action), obs.select.maxCount)
+        self.assertEqual(len(action), len(set(action)))
+        self.assertTrue(all(
+            0 <= int(index) < len(obs.select.option) for index in action
+        ))
+
+        exact_load_evaluator_model(str(
+            Path(ROOT, "exact-evaluator-v3.bin").resolve()
+        ))
+        direct = exact_turn_begin(obs, deck, hand_values, 500)
+        try:
+            self.assertTrue(direct["structurallyBlocked"])
+            self.assertGreater(direct["interruptedTransitionNodes"], 0)
+            self.assertFalse(direct["exactValueCertified"])
+        finally:
+            exact_turn_release(direct["sessionId"])
+
     def test_opening_nighttime_mine_admission_and_general_value_are_bounded(
             self) -> None:
         fixture = Path(

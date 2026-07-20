@@ -13,7 +13,7 @@ Runtime design:
 - canonical keys omit card serials, logs, and RNG state;
 - per-turn sessions resume across selections and return exact score intervals;
 - a cheap native estimate runs at the beginning of each own turn; roots with an
-  immediate multi-draw, a large estimated workload, or a wide early Main use
+  immediate multi-draw, a large estimated workload, or a wide Main use
   the separate general evaluator instead of starting an unlikely-to-finish
   exhaustive search;
 - `exact-evaluator-v3.bin` is trained only on post-checkup turn boundaries;

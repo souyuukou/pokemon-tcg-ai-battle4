@@ -48,10 +48,21 @@ inline void AppearProc(PlayerState& ps, Card& card) {
 
 // openTypeが1なら相手には見えない、2なら両方見えない、3ならプレイヤー0だけ見える、4ならプレイヤー1だけ見える
 inline CardRef MoveCard(State& state, int playerIndex, AreaType fromArea, int fromIndex, AreaType toArea, int openType = 0, bool noLog = false, bool withAttach = false, bool mustMove = false, bool ko = false) {
-	assert(fromArea != toArea);
-
 	PlayerState& ps = state.players.at(playerIndex);
 	CardRef ref = state.getCardRef(fromArea, fromIndex, playerIndex);
+	if (fromArea == toArea) {
+		// A stale deferred card reference can resolve to its destination after
+		// an exact hidden-world branch has already moved that card.  Aborting
+		// here terminates the whole Kaggle agent process, so fail the exact
+		// transition closed and let the planner return an uncertified interval.
+		if (state.exact.enabled) {
+			state.exact.pending = ExactPendingType::Opaque;
+			state.exact.blockReason = ExactBlockReason::InterruptedTransition;
+			return ref;
+		}
+		assert(fromArea != toArea);
+		return ref;
+	}
 	if (fromArea == AreaType::Trash) {
 		if (toArea == AreaType::Hand || toArea == AreaType::Deck || toArea == AreaType::DeckBottom) {
 			const Card& card = state.getCard(ref);
