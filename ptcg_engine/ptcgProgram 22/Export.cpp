@@ -954,7 +954,10 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	 j.appendCommaKey("turnInertIdentities"); AppendUnsignedLongLong(j, decision.metrics.turnInertIdentities);
 	 j.appendCommaKey("macroCollapsedTransitions"); AppendUnsignedLongLong(j, decision.metrics.macroCollapsedTransitions);
 	 j.appendCommaKey("sleepSetPrunes"); AppendUnsignedLongLong(j, decision.metrics.sleepSetPrunes);
-	 j.appendCommaKey("argmaxDominatedCuts"); AppendUnsignedLongLong(j, decision.metrics.argmaxDominatedCuts);
+  j.appendCommaKey("argmaxDominatedCuts"); AppendUnsignedLongLong(j, decision.metrics.argmaxDominatedCuts);
+  j.appendCommaKey("thresholdProofCuts"); AppendUnsignedLongLong(j, decision.metrics.thresholdProofCuts);
+  j.appendCommaKey("thresholdProofLowerHits"); AppendUnsignedLongLong(j, decision.metrics.thresholdProofLowerHits);
+  j.appendCommaKey("thresholdProofUpperHits"); AppendUnsignedLongLong(j, decision.metrics.thresholdProofUpperHits);
 	 j.appendCommaKeyValue("dynamicPartitionFallbackCardId", decision.metrics.dynamicPartitionFallbackCardId);
 	 j.appendCommaKeyValue("dynamicPartitionFallbackEffectType", decision.metrics.dynamicPartitionFallbackEffectType);
 	 j.appendCommaKeyValue("dynamicPartitionFallbackTargetType", decision.metrics.dynamicPartitionFallbackTargetType);
@@ -971,9 +974,53 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	   j.appendCommaKey("lowerDenominator"); AppendExactDenominator(j, decision.rootActions[ri].lower);
 	   j.appendCommaKey("upperNumerator"); AppendExactNumerator(j, decision.rootActions[ri].upper);
 	   j.appendCommaKey("upperDenominator"); AppendExactDenominator(j, decision.rootActions[ri].upper);
-	   j.appendCommaKeyValue("certified", decision.rootActions[ri].certified); j.append('}');
+	   j.appendCommaKeyValue("certified", decision.rootActions[ri].certified);
+	   j.appendCommaKeyValue("boundsSound", decision.rootActions[ri].boundsSound);
+	   j.appendCommaKeyValue("eliminated", decision.rootActions[ri].eliminated);
+	   j.appendCommaKeyValue("hasBeenVisited", decision.rootActions[ri].hasBeenVisited);
+	   j.appendCommaKey("consumedNodes"); AppendUnsignedLongLong(j, decision.rootActions[ri].consumedNodes);
+	   j.appendCommaKey("estimate"); AppendUnsignedLongLong(j, decision.rootActions[ri].estimate);
+	   j.appendCommaKey("localWidth"); AppendLongLong(j, decision.rootActions[ri].localWidth);
+	   j.appendCommaKey("rootWidthContribution"); AppendLongLong(j, decision.rootActions[ri].rootWidthContribution);
+	   j.append('}');
 	 }
 	 j.append(']');
+	 // Phase-0 proof failure summary for offline classification.
+	 {
+		unsigned long long unresolvedChanceWidth = 0;
+		unsigned long long unresolvedDecisionWidth = 0;
+		for (const auto& action : decision.rootActions) {
+			if (action.certified || action.eliminated) continue;
+			if (action.localWidth >= 150'000'000)
+				unresolvedChanceWidth += (unsigned long long)std::max(0LL, action.rootWidthContribution);
+			else
+				unresolvedDecisionWidth += (unsigned long long)std::max(0LL, action.rootWidthContribution);
+		}
+		j.appendCommaKey("unresolvedChanceWidthContribution");
+		AppendUnsignedLongLong(j, unresolvedChanceWidth);
+		j.appendCommaKey("unresolvedDecisionWidthContribution");
+		AppendUnsignedLongLong(j, unresolvedDecisionWidth);
+		const char* failureClass = "none";
+		if (!decision.bestActionCertified) {
+			if (decision.metrics.structurallyBlocked || decision.metrics.opaque > 0
+				|| decision.metrics.memoryLimitReached
+				|| decision.metrics.unsupportedConcreteReference > 0)
+				failureClass = "D_structural";
+			else if (decision.metrics.partialChanceNodes
+				>= std::max(1ULL, decision.metrics.partialDecisionNodes) * 2ULL
+				|| unresolvedChanceWidth >= unresolvedDecisionWidth)
+				failureClass = "A_unresolved_chance";
+			else if (decision.metrics.partialDecisionNodes > decision.metrics.partialChanceNodes)
+				failureClass = "B_decision_branching";
+			else if (decision.metrics.successorMerges + decision.metrics.ttReadHits
+				< std::max(1ULL, decision.metrics.expanded / 100ULL))
+				failureClass = "C_reuse_shortage";
+			else
+				failureClass = "A_unresolved_chance";
+		}
+		j.appendCommaKey("proofFailureClass");
+		j.appendDoubleQuote(failureClass);
+	 }
   if (sessionId >= 0) { j.appendCommaKey("sessionId"); AppendLongLong(j, sessionId); }
   j.append('}');
   return j.buf.c_str();
@@ -1011,6 +1058,56 @@ static const char8_t* ExactGeneralDecisionJson(ApiData* data,
 		data->generalEvaluator ? data->generalEvaluator->modelHash() : 0);
 	j.append('}');
 	return j.buf.c_str();
+}
+
+static ExactRootActionValue MakeRootActionValue(const ExactScore& score,
+	bool eliminated = false, bool hasBeenVisited = false,
+	unsigned long long consumedNodes = 0, unsigned long long estimate = 0) {
+	ExactRootActionValue value;
+	value.action = score.action;
+	value.lower = score.lower;
+	value.upper = score.upper;
+	value.certified = score.certified;
+	value.boundsSound = score.boundsSound;
+	value.eliminated = eliminated;
+	value.hasBeenVisited = hasBeenVisited;
+	value.consumedNodes = consumedNodes;
+	value.estimate = estimate;
+	auto approx = [](const ExactFraction& fraction) -> long double {
+		if (!fraction.valid) return 0.0L;
+		if (fraction.big) return 100'000'000.0L;
+		return (long double)fraction.numerator / (long double)fraction.denominator;
+	};
+	const long double width = approx(score.upper) - approx(score.lower);
+	value.localWidth = (long long)std::llround((double)std::max(0.0L,
+		std::min(200'000'000.0L, width)));
+	return value;
+}
+
+static void FillRootWidthContributions(ExactDecision& decision) {
+	if (!decision.hasProofGap) return;
+	auto approx = [](const ExactFraction& fraction) -> long double {
+		if (!fraction.valid) return 0.0L;
+		if (fraction.big) return 100'000'000.0L;
+		return (long double)fraction.numerator / (long double)fraction.denominator;
+	};
+	const long double bestLower = approx(decision.bestLower);
+	const int bestOption = decision.score.action.empty() ? -1 : decision.score.action.front();
+	for (auto& action : decision.rootActions) {
+		const int option = action.action.empty() ? -1 : action.action.front();
+		const long double upper = approx(action.upper);
+		if (option == bestOption) {
+			// Incumbent contributes the residual gap that still must be closed
+			// by raising its lower or lowering challengers.
+			action.rootWidthContribution = (long long)std::llround((double)std::max(0.0L,
+				approx(decision.maxChallengerUpper) - bestLower));
+		} else if (!action.eliminated) {
+			action.rootWidthContribution = (long long)std::llround((double)std::max(0.0L,
+				upper - bestLower));
+		} else {
+			action.rootWidthContribution = 0;
+		}
+	}
 }
 
 static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
@@ -1187,6 +1284,9 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.macroCollapsedTransitions += from.macroCollapsedTransitions;
 	into.sleepSetPrunes += from.sleepSetPrunes;
 	into.argmaxDominatedCuts += from.argmaxDominatedCuts;
+	into.thresholdProofCuts += from.thresholdProofCuts;
+	into.thresholdProofLowerHits += from.thresholdProofLowerHits;
+	into.thresholdProofUpperHits += from.thresholdProofUpperHits;
 	if (from.certificationScope == ExactSkeleton::CertScope::Argmax)
 		into.certificationScope = ExactSkeleton::CertScope::Argmax;
 	if (from.dynamicPartitionFallbackCardId != 0) {
@@ -1235,6 +1335,7 @@ struct ExactTurnSession {
     bool eliminated = false;
     bool hasBeenVisited = false;
     int lastWorker = -1;
+    ProofGoal proofGoal;
   };
 
   // Tasks are leased only for one bounded slice.  The planner and its partial
@@ -1400,6 +1501,25 @@ struct ExactTurnSession {
       }
       if (selected >= 0) {
         RootTask& task = *tasks[selected];
+        // Propagate root proof goals into the planner for threshold short-circuits.
+        if (best >= 0) {
+          ExactFraction maxOtherUpper = ExactFraction::integer(100'000'000);
+          bool foundOther = false;
+          for (int i = 0; i < (int)tasks.size(); ++i) {
+            if (i == best || tasks[i]->eliminated || !tasks[i]->hasBeenVisited) continue;
+            if (!foundOther || ExactCompare(tasks[i]->score.upper, maxOtherUpper) > 0) {
+              maxOtherUpper = tasks[i]->score.upper;
+              foundOther = true;
+            }
+          }
+          if (selected == best) {
+            task.proofGoal = { ProofDirection::RaiseLower, maxOtherUpper };
+          } else {
+            task.proofGoal = { ProofDirection::LowerUpper, tasks[best]->score.lower };
+          }
+        } else {
+          task.proofGoal = {};
+        }
         if (task.lastWorker >= 0) {
           ++reassignments;
           if (task.lastWorker != workerId) ++steals;
@@ -1533,7 +1653,9 @@ struct ExactTurnSession {
         const int slice = (int)std::max<long long>(1, std::min<long long>(remaining, 500));
         task.planner->setBudgetMilliseconds(slice);
         State local = source; local.game = task.game.get();
+        task.planner->setProofGoal(task.proofGoal);
         ExactScore fresh = task.planner->evaluateRootAction(local, task.option).score;
+        task.planner->clearProofGoal();
         fresh.action = { task.option };
         const unsigned long long expandedAfter = task.planner->currentMetrics().expanded;
         const unsigned long long consumed =
@@ -1569,7 +1691,8 @@ struct ExactTurnSession {
       }
       RootTask& task = *queue.tasks[index];
       ExactScore item = task.score; item.action = { option };
-      decision.rootActions.push_back({ item.action, item.lower, item.upper, item.certified });
+      decision.rootActions.push_back(MakeRootActionValue(item, task.eliminated,
+        task.hasBeenVisited, task.consumedNodes, task.estimate));
       if (!task.hasBeenVisited) allRootTasksVisited = false;
       if (task.eliminated) continue;
       if (first || ExactCompare(item.lower, decision.score.lower) > 0
@@ -1591,7 +1714,9 @@ struct ExactTurnSession {
         continue;
       }
       ExactScore alias = queue.tasks[repIndex]->score; alias.action = { option };
-      decision.rootActions.push_back({ alias.action, alias.lower, alias.upper, alias.certified });
+      decision.rootActions.push_back(MakeRootActionValue(alias,
+        queue.tasks[repIndex]->eliminated, queue.tasks[repIndex]->hasBeenVisited,
+        queue.tasks[repIndex]->consumedNodes, queue.tasks[repIndex]->estimate));
       decision.metrics.successorMerges++;
       decision.metrics.largestEquivalenceClass =
         std::max<unsigned long long>(decision.metrics.largestEquivalenceClass, 2);
@@ -1633,6 +1758,7 @@ struct ExactTurnSession {
       decision.score.boundsSound = decision.score.boundsSound && allOtherBoundsSound;
       decision.score.certified = decision.exactValueCertified;
     }
+    FillRootWidthContributions(decision);
     decision.metrics.rootWorkers = rootParallel ? 2 : 1;
     decision.metrics.rootQueueLeases += queue.leases;
     decision.metrics.rootQueueReassignments += queue.reassignments;
@@ -1868,8 +1994,8 @@ struct ExactTurnSession {
 		auto found = representativeScores.find(option);
 		if (found == representativeScores.end()) {
 			allRootTasksVisited = false;
-			decision.rootActions.push_back({ { option }, ExactFraction::integer(-100'000'000),
-				ExactFraction::integer(100'000'000), false });
+			ExactScore missing; missing.action = { option };
+			decision.rootActions.push_back(MakeRootActionValue(missing));
 			maxUpper = ExactFraction::integer(100'000'000);
 			continue;
 		}
@@ -1877,7 +2003,9 @@ struct ExactTurnSession {
 			|| !workers[representativeWorker[option]]->visited[option])
 			allRootTasksVisited = false;
 		ExactScore item = found->second; item.action = { option };
-		decision.rootActions.push_back({ item.action, item.lower, item.upper, item.certified });
+		decision.rootActions.push_back(MakeRootActionValue(item, false,
+			representativeWorker.find(option) != representativeWorker.end()
+			&& workers[representativeWorker[option]]->visited[option]));
 		if (first || ExactCompare(item.lower, decision.score.lower) > 0
 			|| (ExactCompare(item.lower, decision.score.lower) == 0 && item.action < decision.score.action)) {
 		  decision.score = item; selectedWorker = representativeWorker[option]; first = false;
@@ -1889,7 +2017,7 @@ struct ExactTurnSession {
 		auto found = representativeScores.find(representative[option]);
 		if (found == representativeScores.end()) continue;
 		ExactScore alias = found->second; alias.action = { option };
-		decision.rootActions.push_back({ alias.action, alias.lower, alias.upper, alias.certified });
+		decision.rootActions.push_back(MakeRootActionValue(alias));
 		decision.metrics.successorMerges++;
 		decision.metrics.largestEquivalenceClass = std::max<unsigned long long>(decision.metrics.largestEquivalenceClass, 2);
 	  }
@@ -1923,6 +2051,7 @@ struct ExactTurnSession {
 		decision.score.boundsSound = decision.score.boundsSound && allOtherBoundsSound;
 		decision.score.certified = decision.exactValueCertified;
 	  }
+	  FillRootWidthContributions(decision);
       int other = 1 - selectedWorker;
       discardedMetrics = workers[other]->planner->currentMetrics();
 	  alternateWorker = std::move(workers[other]);
@@ -2019,7 +2148,9 @@ struct ExactTurnSession {
         const int slice = (int)std::max<long long>(1, std::min<long long>(remaining, 500));
         task.planner->setBudgetMilliseconds(slice);
         State local = source; local.game = task.game.get();
+        task.planner->setProofGoal(task.proofGoal);
         ExactScore fresh = task.planner->evaluateRootAction(local, task.option).score;
+        task.planner->clearProofGoal();
         fresh.action = { task.option };
         const unsigned long long expandedAfter = task.planner->currentMetrics().expanded;
         const unsigned long long consumed = expandedAfter >= expandedBefore ? expandedAfter - expandedBefore : 0;
@@ -2051,7 +2182,9 @@ struct ExactTurnSession {
         continue;
       }
       ExactScore item = queue.tasks[index]->score; item.action = { option };
-      decision.rootActions.push_back({ item.action, item.lower, item.upper, item.certified });
+      decision.rootActions.push_back(MakeRootActionValue(item,
+        queue.tasks[index]->eliminated, queue.tasks[index]->hasBeenVisited,
+        queue.tasks[index]->consumedNodes, queue.tasks[index]->estimate));
       if (!queue.tasks[index]->hasBeenVisited) allRootTasksVisited = false;
       if (queue.tasks[index]->eliminated) continue;
       if (first || ExactCompare(item.lower, decision.score.lower) > 0
@@ -2070,7 +2203,9 @@ struct ExactTurnSession {
         continue;
       }
       ExactScore alias = queue.tasks[repIndex]->score; alias.action = { option };
-      decision.rootActions.push_back({ alias.action, alias.lower, alias.upper, alias.certified });
+      decision.rootActions.push_back(MakeRootActionValue(alias,
+        queue.tasks[repIndex]->eliminated, queue.tasks[repIndex]->hasBeenVisited,
+        queue.tasks[repIndex]->consumedNodes, queue.tasks[repIndex]->estimate));
       decision.metrics.successorMerges++;
       decision.metrics.largestEquivalenceClass = std::max<unsigned long long>(decision.metrics.largestEquivalenceClass, 2);
     }
@@ -2110,6 +2245,7 @@ struct ExactTurnSession {
 		decision.score.boundsSound = decision.score.boundsSound && allOtherBoundsSound;
       decision.score.certified = decision.exactValueCertified;
     }
+    FillRootWidthContributions(decision);
     decision.metrics.rootWorkers = rootParallel ? 2 : 1;
     decision.metrics.rootQueueLeases += queue.leases;
     decision.metrics.rootQueueReassignments += queue.reassignments;

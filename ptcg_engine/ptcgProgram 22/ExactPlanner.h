@@ -538,6 +538,14 @@ struct ExactScore {
 	bool certificationBlocked = false;
 };
 
+enum class ProofDirection : unsigned char { None, RaiseLower, LowerUpper };
+
+struct ProofGoal {
+	ProofDirection direction = ProofDirection::None;
+	ExactFraction threshold = ExactFraction::integer(0);
+	bool active() const { return direction != ProofDirection::None; }
+};
+
 struct BoundMergeResult {
 	ExactScore score;
 	bool contradiction = false;
@@ -586,6 +594,13 @@ struct ExactRootActionValue {
 	ExactFraction lower;
 	ExactFraction upper;
 	bool certified = false;
+	bool boundsSound = false;
+	bool eliminated = false;
+	bool hasBeenVisited = false;
+	unsigned long long consumedNodes = 0;
+	unsigned long long estimate = 0;
+	long long localWidth = 200'000'000;
+	long long rootWidthContribution = 0;
 };
 
 // Completed exact entries are immutable, so they can safely be shared by the
@@ -956,6 +971,9 @@ struct ExactMetrics {
 	unsigned long long macroCollapsedTransitions = 0;
 	unsigned long long sleepSetPrunes = 0;
 	unsigned long long argmaxDominatedCuts = 0;
+	unsigned long long thresholdProofCuts = 0;
+	unsigned long long thresholdProofLowerHits = 0;
+	unsigned long long thresholdProofUpperHits = 0;
 	int dynamicPartitionFallbackCardId = 0;
 	int dynamicPartitionFallbackEffectType = 0;
 	int dynamicPartitionFallbackTargetType = 0;
@@ -1227,6 +1245,8 @@ public:
 	void setReverseActionOrder(bool reverse) { reverseActionOrder = reverse; }
 	void setConcreteWorldCaching(bool enabled) { concreteWorldCaching = enabled; }
 	void setInFlightClaims(bool enabled) { inFlightClaimsEnabled = enabled; }
+	void setProofGoal(ProofGoal goal) { activeProofGoal = goal; }
+	void clearProofGoal() { activeProofGoal = {}; }
 
 	// Exact search never exposes engine logs to the caller and rule evaluation
 	// does not read them.  Run against a private Game scratch object with log
@@ -1823,6 +1843,7 @@ private:
 	int recursionDepth = 0;
 	bool canonicalMainEnabled = false;
 	bool reverseActionOrder = false;
+	ProofGoal activeProofGoal;
 	bool skeletonSharingEnabled = false;
 	bool v4PassiveDrawEnabled = false;
 	bool v4PassiveDrawCertified = false; // Moment Passive + identity oracle gates
@@ -6126,7 +6147,9 @@ private:
 			&& (!singletonRevealStreaming || (canonicalMainEnabled && concreteWorldCaching)))
 			? partialDecisionFor(nodeKey) : nullptr;
 		size_t actionOrdinal = 0;
+		bool thresholdCut = false;
 		bool completed = forEachLegalAction(state, [&](const ExactSmallAction& action) {
+			if (thresholdCut) return false;
 			metrics.rawOutcomes++;
 			// forEachLegalAction already groups physical options by this exact
 			// semantic key. Build it again only when a persistent partial/transition
@@ -6155,6 +6178,34 @@ private:
 				if (recursionDepth == 1)
 					rootActionValues.push_back({ action, score.lower, score.upper,
 						score.certified && score.boundsSound });
+				if (activeProofGoal.active() && score.boundsSound) {
+					if (maximize && activeProofGoal.direction == ProofDirection::RaiseLower
+						&& ExactCompare(score.lower, activeProofGoal.threshold) >= 0) {
+						result = score; result.action = action;
+						const UnresolvedPoles poles = unresolvedChancePoles(state);
+						result.upper = poles.upper;
+						if (ExactCompare(aggregate, result.upper) > 0) result.upper = aggregate;
+						result.certified = ExactCompare(result.lower, result.upper) == 0;
+						result.boundsSound = true;
+						metrics.thresholdProofCuts++;
+						metrics.thresholdProofLowerHits++;
+						thresholdCut = true;
+						return false;
+					}
+					if (!maximize && activeProofGoal.direction == ProofDirection::LowerUpper
+						&& ExactCompare(score.upper, activeProofGoal.threshold) <= 0) {
+						result = score; result.action = action;
+						const UnresolvedPoles poles = unresolvedChancePoles(state);
+						result.lower = poles.lower;
+						if (ExactCompare(aggregate, result.lower) < 0) result.lower = aggregate;
+						result.certified = ExactCompare(result.lower, result.upper) == 0;
+						result.boundsSound = true;
+						metrics.thresholdProofCuts++;
+						metrics.thresholdProofUpperHits++;
+						thresholdCut = true;
+						return false;
+					}
+				}
 				return true;
 			}
 			// Do not start a new unsolved child after the deadline. Returning
@@ -6259,12 +6310,50 @@ private:
 				selectedActionValueCertified = score.certified;
 				first = false;
 			}
+			// Phase 1 threshold proof: stop once the active goal is satisfied.
+			if (activeProofGoal.active() && score.boundsSound) {
+				if (maximize && activeProofGoal.direction == ProofDirection::RaiseLower
+					&& ExactCompare(score.lower, activeProofGoal.threshold) >= 0) {
+					result = score; result.action = action;
+					selectedActionValueCertified = score.certified;
+					const UnresolvedPoles poles = unresolvedChancePoles(state);
+					result.upper = poles.upper;
+					if (ExactCompare(aggregate, result.upper) > 0) result.upper = aggregate;
+					result.certified = ExactCompare(result.lower, result.upper) == 0;
+					result.boundsSound = true;
+					metrics.thresholdProofCuts++;
+					metrics.thresholdProofLowerHits++;
+					thresholdCut = true;
+					return false;
+				}
+				if (!maximize && activeProofGoal.direction == ProofDirection::LowerUpper
+					&& ExactCompare(score.upper, activeProofGoal.threshold) <= 0) {
+					result = score; result.action = action;
+					selectedActionValueCertified = score.certified;
+					const UnresolvedPoles poles = unresolvedChancePoles(state);
+					result.lower = poles.lower;
+					if (ExactCompare(aggregate, result.lower) < 0) result.lower = aggregate;
+					result.certified = ExactCompare(result.lower, result.upper) == 0;
+					result.boundsSound = true;
+					metrics.thresholdProofCuts++;
+					metrics.thresholdProofUpperHits++;
+					thresholdCut = true;
+					return false;
+				}
+			}
 			// Always report this child as processed so a deadline that fires
 			// during the last child does not discard a complete aggregate.
 			return true;
 		});
 		if (completed && partial != nullptr) partial->resumeOrdinal = 0;
 		if (first) return unknown();
+		if (thresholdCut) {
+			metrics.partialDecisionNodes++;
+			if (!singletonRevealStreaming) rememberPolicy(state, result,
+				selectedActionValueCertified, result.certified, result.certified,
+				metrics.expanded - expandedBefore);
+			return result;
+		}
 		if (!completed) {
 			// If every legal action already has a sound bound in the partial table,
 			// the Max/Min aggregate opposite pole is known even when this slice
