@@ -38,17 +38,25 @@ namespace ExactSkeleton {
 enum class CertScope : unsigned char { ExactEvaluatorExpectation, Argmax };
 
 inline CertScope CertScopeFromEnvironment() {
+	// Default is argmax proof: stop once best.lower >= max(other.upper).
+	// Set PTCG_EXACT_CERT_SCOPE=exact to require a point-valued best action.
 #ifdef _WIN32
 	char configured[64]{};
 	DWORD length = GetEnvironmentVariableA("PTCG_EXACT_CERT_SCOPE", configured, (DWORD)std::size(configured));
-	if (length == 0 || length >= std::size(configured)) return CertScope::ExactEvaluatorExpectation;
+	if (length == 0 || length >= std::size(configured)) return CertScope::Argmax;
+	if (_stricmp(configured, "exact") == 0
+		|| _stricmp(configured, "exact_evaluator_expectation") == 0)
+		return CertScope::ExactEvaluatorExpectation;
 	if (_stricmp(configured, "argmax") == 0) return CertScope::Argmax;
 #else
 	const char* configured = std::getenv("PTCG_EXACT_CERT_SCOPE");
-	if (configured == nullptr) return CertScope::ExactEvaluatorExpectation;
+	if (configured == nullptr) return CertScope::Argmax;
+	if (std::strcmp(configured, "exact") == 0
+		|| std::strcmp(configured, "exact_evaluator_expectation") == 0)
+		return CertScope::ExactEvaluatorExpectation;
 	if (std::strcmp(configured, "argmax") == 0) return CertScope::Argmax;
 #endif
-	return CertScope::ExactEvaluatorExpectation;
+	return CertScope::Argmax;
 }
 
 inline const char* CertScopeName(CertScope scope) {

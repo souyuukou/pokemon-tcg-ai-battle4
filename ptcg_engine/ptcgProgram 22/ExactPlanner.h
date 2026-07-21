@@ -982,6 +982,10 @@ struct ExactDecision {
 	bool actionValueCertified = false;
 	bool bestActionCertified = false;
 	bool exactValueCertified = false;
+	// Argmax proof-gap diagnostics (Phase 0).
+	ExactFraction bestLower = ExactFraction::integer(-100'000'000);
+	ExactFraction maxChallengerUpper = ExactFraction::integer(100'000'000);
+	bool hasProofGap = false;
 };
 
 struct ExactGeneralActionValue {
@@ -1303,7 +1307,11 @@ public:
 		canonicalMainEnabled = root.selectType == SelectType::Main && root.options.size() > 2;
 		nodeQuantumDeadline = canonicalMainEnabled ? metrics.expanded + 20'000ULL
 			: std::numeric_limits<unsigned long long>::max();
-		if (v4PassiveDrawEnabled)
+		// Argmax proof needs sound opposite-side aggregates. The 20k-node quantum
+		// returned incomplete Max nodes with upper=+1e8 even when the wall-clock
+		// slice still had time to finish sibling actions. Prefer the slice deadline.
+		if (v4PassiveDrawEnabled
+			|| metrics.certificationScope == ExactSkeleton::CertScope::Argmax)
 			nodeQuantumDeadline = std::numeric_limits<unsigned long long>::max();
 		metrics.currentRootAction = optionIndex;
 		actor = root.selectPlayer;
@@ -1841,6 +1849,45 @@ private:
 			partialBytes -= std::min(partialBytes, entryBytes - newBytes);
 		}
 		entryBytes = newBytes;
+	}
+
+	// Stage-1 unresolved poles: if this subtree cannot reach a terminal win/loss
+	// on the current turn (conservative), use the non-terminal evaluator range
+	// instead of ±1e8. Even a small unresolved chance mass then stops inflating
+	// the root interval by millions of points.
+	struct UnresolvedPoles {
+		ExactFraction lower = ExactFraction::integer(-100'000'000);
+		ExactFraction upper = ExactFraction::integer(100'000'000);
+	};
+
+	UnresolvedPoles unresolvedChancePoles(const State& state) const {
+		UnresolvedPoles wide;
+		if (state.isFinish()) return wide;
+		if (state.exact.pending == ExactPendingType::TakePrize) return wide;
+		constexpr int kMaxPrizeFromOneKo = 2;
+		for (int p = 0; p < 2; ++p) {
+			int prizeLeft = 0;
+			for (CardRef ref : state.players[p].prize)
+				if (ref.isNull()) ++prizeLeft;
+			if (prizeLeft <= 0) prizeLeft = (int)state.players[p].prize.size();
+			if (prizeLeft <= kMaxPrizeFromOneKo) return wide;
+		}
+		if (state.exact.pending == ExactPendingType::Draw
+			|| state.exact.pending == ExactPendingType::RevealDeck) {
+			const int p = state.exact.pendingPlayer;
+			if (p >= 0 && p < 2) {
+				const int need = std::max(1, (int)state.exact.pendingCount);
+				if ((int)state.players[p].deck.size() < need) return wide;
+			}
+		}
+		long long lim = ExactSparseEvaluatorV3::NonTerminalLimit;
+		// Unclamped V4 analytic ranges can be astronomically wide; Stage-1 only
+		// uses the non-terminal leaf clamp, matching Python NON_TERMINAL_LIMIT.
+		(void)evaluator;
+		UnresolvedPoles narrow;
+		narrow.lower = ExactFraction::integer(-lim);
+		narrow.upper = ExactFraction::integer(lim);
+		return narrow;
 	}
 
 	bool expired() {
@@ -3004,6 +3051,12 @@ private:
 			if (timer.sample) metrics.evaluatorInferenceSampleNs += (unsigned long long)
 				std::chrono::duration_cast<std::chrono::nanoseconds>(
 					std::chrono::steady_clock::now() - inferenceStarted).count();
+			// Match Python NON_TERMINAL_LIMIT so unresolved Stage-1 poles (±90M)
+			// remain sound relative to leaf evaluations.
+			if (result > ExactSparseEvaluatorV3::NonTerminalLimit)
+				result = ExactSparseEvaluatorV3::NonTerminalLimit;
+			if (result < -ExactSparseEvaluatorV3::NonTerminalLimit)
+				result = -ExactSparseEvaluatorV3::NonTerminalLimit;
 			return result;
 		}
 		return 0;
@@ -3756,8 +3809,9 @@ private:
 		ExactWeight remaining = processedWeight >= totalWeight ? ExactWeight()
 			: ExactWeight::subtract(totalWeight, processedWeight);
 		if (!remaining.zero()) {
-			lower = ExactFraction::add(lower, ExactFraction::integer(-100'000'000).scaled(remaining, totalWeight));
-			upper = ExactFraction::add(upper, ExactFraction::integer(100'000'000).scaled(remaining, totalWeight));
+			const UnresolvedPoles poles = unresolvedChancePoles(parent);
+			lower = ExactFraction::add(lower, poles.lower.scaled(remaining, totalWeight));
+			upper = ExactFraction::add(upper, poles.upper.scaled(remaining, totalWeight));
 			metrics.partialChanceNodes++;
 		}
 		metrics.rawOutcomes += handWorlds;
@@ -3961,8 +4015,9 @@ private:
 				covered += currentWeight;
 			}
 			ExactWeight remaining = covered >= totalWeight ? ExactWeight() : ExactWeight::subtract(totalWeight, covered);
-			lower = ExactFraction::add(lower, ExactFraction::integer(-100'000'000).scaled(remaining, totalWeight));
-			upper = ExactFraction::add(upper, ExactFraction::integer(100'000'000).scaled(remaining, totalWeight));
+			const UnresolvedPoles poles = unresolvedChancePoles(parent);
+			lower = ExactFraction::add(lower, poles.lower.scaled(remaining, totalWeight));
+			upper = ExactFraction::add(upper, poles.upper.scaled(remaining, totalWeight));
 			return ExactScore{ lower, upper, {}, false };
 		};
 		std::vector<int> handCounts(parent.exact.typeCount[player], 0);
@@ -4076,8 +4131,9 @@ private:
 				covered = ExactWeight::add(covered, currentWeight); noteWeight(covered);
 			}
 			ExactWeight remaining = covered >= totalWeight ? ExactWeight() : ExactWeight::subtract(totalWeight, covered);
-			lower = ExactFraction::add(lower, ExactFraction::integer(-100'000'000).scaled(remaining, totalWeight));
-			upper = ExactFraction::add(upper, ExactFraction::integer(100'000'000).scaled(remaining, totalWeight));
+			const UnresolvedPoles poles = unresolvedChancePoles(parent);
+			lower = ExactFraction::add(lower, poles.lower.scaled(remaining, totalWeight));
+			upper = ExactFraction::add(upper, poles.upper.scaled(remaining, totalWeight));
 			if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return unknown(); }
 			return ExactScore{ lower, upper, {}, false };
 		};
@@ -5330,8 +5386,9 @@ private:
 				covered += partial.pendingWeight;
 			}
 			ExactWeight remaining = covered >= total ? ExactWeight() : ExactWeight::subtract(total, covered);
-			lower = ExactFraction::add(lower, ExactFraction::integer(-100'000'000).scaled(remaining, total));
-			upper = ExactFraction::add(upper, ExactFraction::integer(100'000'000).scaled(remaining, total));
+			const UnresolvedPoles poles = unresolvedChancePoles(state);
+			lower = ExactFraction::add(lower, poles.lower.scaled(remaining, total));
+			upper = ExactFraction::add(upper, poles.upper.scaled(remaining, total));
 			return ExactScore{ lower, upper, {}, false };
 		};
 		while (true) {
@@ -5593,6 +5650,11 @@ private:
 				partialMultiDraws.erase(found); return unknown();
 			}
 			std::sort(partial.outcomes.begin(), partial.outcomes.end(), [](const auto& left, const auto& right) {
+				// Prefer high-probability outcomes first. Unresolved width is
+				// uniform (±1e8) until an outcome is solved, so p×width/cost
+				// reduces to weight order when costs are unknown a priori.
+				const int weightCmp = ExactWeight::compare(left.weight, right.weight);
+				if (weightCmp != 0) return weightCmp > 0;
 				return left.continuationKey < right.continuationKey;
 			});
 			partial.outcomeDone.assign(partial.outcomes.size(), 0);
@@ -5631,8 +5693,9 @@ private:
 				covered += partial.pendingWeight;
 			}
 			ExactWeight remaining = covered >= total ? ExactWeight() : ExactWeight::subtract(total, covered);
-			lower = ExactFraction::add(lower, ExactFraction::integer(-100'000'000).scaled(remaining, total));
-			upper = ExactFraction::add(upper, ExactFraction::integer(100'000'000).scaled(remaining, total));
+			const UnresolvedPoles poles = unresolvedChancePoles(state);
+			lower = ExactFraction::add(lower, poles.lower.scaled(remaining, total));
+			upper = ExactFraction::add(upper, poles.upper.scaled(remaining, total));
 			return ExactScore{ lower, upper, {}, false };
 		};
 		// A combination can be much larger than the normal 20k-node root
@@ -5758,6 +5821,11 @@ private:
 							continue;
 						todo.push_back(i);
 					}
+					// Process high-mass unresolved outcomes first (proof contribution).
+					std::stable_sort(todo.begin(), todo.end(), [&](size_t a, size_t b) {
+						return ExactWeight::compare(partial.outcomes[a].weight,
+							partial.outcomes[b].weight) > 0;
+					});
 					std::atomic<size_t> cursor{ 0 };
 					std::mutex mergeMutex;
 					const auto sharedDeadline = deadline;
@@ -5975,8 +6043,9 @@ private:
 			if (expired()) {
 				metrics.partialChanceNodes++;
 				ExactWeight remaining = ExactWeight::subtract(total, processed);
-				lower = ExactFraction::add(lower, ExactFraction::integer(-100'000'000).scaled(remaining, total));
-				upper = ExactFraction::add(upper, ExactFraction::integer(100'000'000).scaled(remaining, total));
+				const UnresolvedPoles poles = unresolvedChancePoles(state);
+				lower = ExactFraction::add(lower, poles.lower.scaled(remaining, total));
+				upper = ExactFraction::add(upper, poles.upper.scaled(remaining, total));
 				return { lower, upper, {}, false };
 			}
 			ExactScore score;
@@ -6088,6 +6157,11 @@ private:
 						score.certified && score.boundsSound });
 				return true;
 			}
+			// Do not start a new unsolved child after the deadline. Returning
+			// false here means "not all children visited" — unlike finishing the
+			// last child and then observing expiry, which used to wipe a sound
+			// Max aggregate upper back to +1e8.
+			if (expired()) return false;
 			std::string transitionKey;
 			// Streaming hidden-world searches almost never revisit the exact same
 			// (node, action) pair before StateId interning. Building and hashing the
@@ -6185,13 +6259,70 @@ private:
 				selectedActionValueCertified = score.certified;
 				first = false;
 			}
-			return !expired();
+			// Always report this child as processed so a deadline that fires
+			// during the last child does not discard a complete aggregate.
+			return true;
 		});
 		if (completed && partial != nullptr) partial->resumeOrdinal = 0;
 		if (first) return unknown();
 		if (!completed) {
-			if (maximize) result.upper = ExactFraction::integer(100'000'000);
-			else result.lower = ExactFraction::integer(-100'000'000);
+			// If every legal action already has a sound bound in the partial table,
+			// the Max/Min aggregate opposite pole is known even when this slice
+			// expired before deepening.  Do NOT wipe that aggregate back to ±1e8.
+			bool covered = false;
+			ExactFraction coveredAggregate = maximize
+				? ExactFraction::integer(-100'000'000)
+				: ExactFraction::integer(100'000'000);
+			ExactScore coveredBest;
+			bool coveredFirst = true;
+			bool coveredSound = true;
+			bool coveredCertified = true;
+			if (partial != nullptr && !partial->actionBounds.empty()) {
+				covered = true;
+				forEachLegalAction(state, [&](const ExactSmallAction& action) {
+					const std::string actionKey = actionEquivalenceKey(state, action);
+					auto found = partial->actionBounds.find(actionKey);
+					if (found == partial->actionBounds.end() || !found->second.boundsSound) {
+						covered = false;
+						return false;
+					}
+					const ExactScore& score = found->second;
+					if (maximize) {
+						if (ExactCompare(score.upper, coveredAggregate) > 0)
+							coveredAggregate = score.upper;
+					} else if (ExactCompare(score.lower, coveredAggregate) < 0) {
+						coveredAggregate = score.lower;
+					}
+					if (coveredFirst
+						|| (maximize ? ExactCompare(score.lower, coveredBest.lower) > 0
+							: ExactCompare(score.upper, coveredBest.upper) < 0)) {
+						coveredBest = score;
+						coveredBest.action = action;
+						coveredFirst = false;
+					}
+					coveredSound = coveredSound && score.boundsSound;
+					coveredCertified = coveredCertified && score.certified;
+					return true;
+				});
+			}
+			if (covered && !coveredFirst) {
+				result = coveredBest;
+				if (maximize) result.upper = coveredAggregate;
+				else result.lower = coveredAggregate;
+				result.certified = coveredCertified && coveredSound
+					&& ExactCompare(result.lower, result.upper) == 0;
+				result.boundsSound = coveredSound;
+				metrics.partialDecisionNodes++;
+				if (!singletonRevealStreaming) rememberPolicy(state, result,
+					result.certified, result.certified, result.certified,
+					metrics.expanded - expandedBefore);
+				return result;
+			}
+			{
+				const UnresolvedPoles poles = unresolvedChancePoles(state);
+				if (maximize) result.upper = poles.upper;
+				else result.lower = poles.lower;
+			}
 			result.certified = false;
 			result.boundsSound = allBoundsSound;
 			metrics.partialDecisionNodes++;

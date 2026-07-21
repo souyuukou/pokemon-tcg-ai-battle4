@@ -719,6 +719,23 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
   j.appendCommaKeyValue("actionValueCertified", decision.actionValueCertified);
   j.appendCommaKeyValue("bestActionCertified", decision.bestActionCertified);
   j.appendCommaKeyValue("exactValueCertified", decision.exactValueCertified);
+  j.appendCommaKeyValue("hasProofGap", decision.hasProofGap);
+  j.appendCommaKey("bestLowerNumerator"); AppendExactNumerator(j, decision.bestLower);
+  j.appendCommaKey("bestLowerDenominator"); AppendExactDenominator(j, decision.bestLower);
+  j.appendCommaKey("maxChallengerUpperNumerator"); AppendExactNumerator(j, decision.maxChallengerUpper);
+  j.appendCommaKey("maxChallengerUpperDenominator"); AppendExactDenominator(j, decision.maxChallengerUpper);
+  {
+    // Approximate proofGap = maxChallengerUpper - bestLower for dashboards.
+    auto approx = [](const ExactFraction& value) -> long double {
+      if (!value.valid) return 0.0L;
+      if (value.big) return 100'000'000.0L;
+      return (long double)value.numerator / (long double)value.denominator;
+    };
+    const long double gap = decision.hasProofGap
+      ? (approx(decision.maxChallengerUpper) - approx(decision.bestLower)) : 0.0L;
+    j.appendCommaKey("proofGap");
+    AppendLongLong(j, (long long)std::llround((double)gap));
+  }
   j.appendCommaKeyValue("resumable", !decision.metrics.structurallyBlocked
     && decision.metrics.boundContradictions == 0
     && !decision.bestActionCertified && !decision.exactValueCertified);
@@ -1205,6 +1222,12 @@ struct ExactTurnSession {
     unsigned long long consumedNodes = 0;
     ExactScore score;
     long double intervalWidth = 200'000'000.0L;
+    // EMA of bound improvement rates for proof-contribution scheduling.
+    long double lowerGainPerNode = 0.0L;
+    long double upperReductionPerNode = 0.0L;
+    ExactFraction previousLower = ExactFraction::integer(-100'000'000);
+    ExactFraction previousUpper = ExactFraction::integer(100'000'000);
+    bool hasPreviousBounds = false;
     std::unique_ptr<Game> game;
     std::unique_ptr<ExactPlanner> planner;
     bool claimed = false;
@@ -1225,23 +1248,37 @@ struct ExactTurnSession {
     unsigned long long steals = 0;
     unsigned long long eliminations = 0;
     unsigned long long boundContradictions = 0;
+    unsigned long long argmaxReadyStops = 0;
 
-    bool exactDecisionReadyLocked() const {
+    int findHighestLowerBoundTaskLocked() const {
       int best = -1;
       for (int i = 0; i < (int)tasks.size(); ++i) {
         const RootTask& task = *tasks[i];
-        if (task.eliminated) continue;
-        if (task.blocked || !task.hasBeenVisited || !task.score.boundsSound)
-          return false;
+        if (task.eliminated || !task.hasBeenVisited || !task.score.boundsSound)
+          continue;
         if (best < 0 || ExactCompare(task.score.lower, tasks[best]->score.lower) > 0
             || (ExactCompare(task.score.lower, tasks[best]->score.lower) == 0
               && task.option < tasks[best]->option))
           best = i;
       }
-      if (best < 0 || !tasks[best]->score.certified) return false;
+      return best;
+    }
+
+    // Argmax proof: best.lower >= max(other.upper) with sound bounds.
+    // Do NOT require a point-valued (certified) incumbent — that is exact-value
+    // proof, not best-action proof.
+    bool exactDecisionReadyLocked() const {
+      const int best = findHighestLowerBoundTaskLocked();
+      if (best < 0) return false;
+      const RootTask& incumbent = *tasks[best];
+      if (!incumbent.hasBeenVisited || !incumbent.score.boundsSound)
+        return false;
       for (int i = 0; i < (int)tasks.size(); ++i) {
         if (i == best || tasks[i]->eliminated) continue;
-        if (ExactCompare(tasks[i]->score.upper, tasks[best]->score.lower) > 0)
+        const RootTask& challenger = *tasks[i];
+        if (!challenger.hasBeenVisited || !challenger.score.boundsSound)
+          return false;
+        if (ExactCompare(challenger.score.upper, incumbent.score.lower) > 0)
           return false;
       }
       return true;
@@ -1261,19 +1298,101 @@ struct ExactTurnSession {
 
     int acquire(int workerId) {
       std::lock_guard<std::mutex> lock(mutex);
-      if (exactDecisionReadyLocked()) return -1;
+      if (exactDecisionReadyLocked()) {
+        ++argmaxReadyStops;
+        return -1;
+      }
+      const int best = findHighestLowerBoundTaskLocked();
+      long double bestLowerApprox = -100'000'000.0L;
+      long double maxOtherUpperApprox = -100'000'000.0L;
+      bool hasOther = false;
+      if (best >= 0) bestLowerApprox = fractionApprox(tasks[best]->score.lower);
+      for (int i = 0; i < (int)tasks.size(); ++i) {
+        if (i == best || tasks[i]->eliminated || !tasks[i]->hasBeenVisited) continue;
+        const long double upper = fractionApprox(tasks[i]->score.upper);
+        if (!hasOther || upper > maxOtherUpperApprox) {
+          maxOtherUpperApprox = upper;
+          hasOther = true;
+        }
+      }
+      if (!hasOther) maxOtherUpperApprox = 100'000'000.0L;
+
       int selected = -1;
       long double selectedPriority = -1.0L;
+      // Once the incumbent is a point value, argmax proof reduces to lowering
+      // every remaining challenger upper. Focus exclusively on the widest
+      // blocking challenger instead of splitting time with the incumbent.
+      const bool incumbentPoint = best >= 0 && tasks[best]->score.certified
+        && tasks[best]->score.boundsSound
+        && ExactCompare(tasks[best]->score.lower, tasks[best]->score.upper) == 0;
+      int widestBlocker = -1;
+      long double widestUpper = -1.0L;
+      if (incumbentPoint) {
+        for (int i = 0; i < (int)tasks.size(); ++i) {
+          if (i == best || tasks[i]->eliminated || tasks[i]->claimed || tasks[i]->blocked)
+            continue;
+          if (tasks[i]->score.certified && tasks[i]->score.boundsSound) continue;
+          if (!tasks[i]->hasBeenVisited) continue;
+          const long double upper = fractionApprox(tasks[i]->score.upper);
+          if (upper <= bestLowerApprox) continue;
+          if (widestBlocker < 0 || upper > widestUpper
+              || (upper == widestUpper && tasks[i]->option < tasks[widestBlocker]->option)) {
+            widestBlocker = i;
+            widestUpper = upper;
+          }
+        }
+      }
       for (int i = 0; i < (int)tasks.size(); ++i) {
         const RootTask& task = *tasks[i];
         if (task.claimed || task.blocked || task.eliminated
             || (task.score.certified && task.score.boundsSound)) continue;
-        const bool intervalOpen = ExactCompare(task.score.upper, task.score.lower) > 0;
-        const long double widthBonus = 1.0L
-          + std::min(task.intervalWidth, 200'000'000.0L) / 200'000'000.0L;
-        const long double priority = (long double)(task.estimate + 1ULL)
-          / (long double)(task.consumedNodes + 1ULL) * (intervalOpen ? 2.0L : 1.0L)
-          * widthBonus;
+        if (incumbentPoint && widestBlocker >= 0 && i != widestBlocker
+            && task.hasBeenVisited)
+          continue;
+        const long double taskLower = fractionApprox(task.score.lower);
+        const long double taskUpper = fractionApprox(task.score.upper);
+        long double remainingProofGap = 0.0L;
+        long double expectedImprovement = 0.0L;
+        if (best >= 0 && i == best) {
+          // Incumbent: raise lower until it meets the strongest challenger upper.
+          remainingProofGap = std::max(0.0L, maxOtherUpperApprox - taskLower);
+          expectedImprovement = task.lowerGainPerNode > 1e-12L
+            ? task.lowerGainPerNode
+            : std::max(1.0L, task.intervalWidth / 200'000'000.0L);
+        } else if (best >= 0) {
+          // Challenger: lower upper until it falls at or below incumbent lower.
+          remainingProofGap = std::max(0.0L, taskUpper - bestLowerApprox);
+          expectedImprovement = task.upperReductionPerNode > 1e-12L
+            ? task.upperReductionPerNode
+            : std::max(1.0L, task.intervalWidth / 200'000'000.0L);
+          // Near-incumbent lowers are the actions that still threaten argmax.
+          if (task.hasBeenVisited && taskLower > bestLowerApprox - 5'000'000.0L)
+            expectedImprovement *= 8.0L;
+        } else {
+          // No sound incumbent yet: prefer wide, cheap-to-start tasks.
+          remainingProofGap = task.intervalWidth;
+          expectedImprovement = std::max(1.0L, task.intervalWidth / 200'000'000.0L);
+        }
+        // Unvisited root actions keep the default upper (+1e8) and therefore
+        // block argmax proof. Force a first observation before deep work on
+        // heavy estimate branches; otherwise search-card estimates starve them.
+        long double priority = 0.0L;
+        if (!task.hasBeenVisited) {
+          priority = 1e18L + remainingProofGap
+            + (long double)(1'000'000ULL / (task.estimate + 1ULL));
+        } else {
+          const long double estimatedRemainingCost =
+            (long double)(task.estimate + 1ULL) / (long double)(task.consumedNodes + 1ULL);
+          // Prefer challengers whose interval has already collapsed — finishing
+          // them is what actually lowers maxChallengerUpper for argmax proof.
+          const long double collapseRatio =
+            remainingProofGap / std::max(1.0L, taskUpper - taskLower);
+          priority =
+            remainingProofGap * expectedImprovement * std::max(1.0L, collapseRatio)
+            / std::max(1e-9L, estimatedRemainingCost);
+          if (incumbentPoint && i == widestBlocker)
+            priority += 1e15L;
+        }
         if (selected < 0 || priority > selectedPriority
             || (priority == selectedPriority && task.option < tasks[selected]->option)) {
           selected = i; selectedPriority = priority;
@@ -1295,6 +1414,10 @@ struct ExactTurnSession {
       std::lock_guard<std::mutex> lock(mutex);
       if (index < 0 || index >= (int)tasks.size()) return;
       RootTask& task = *tasks[index];
+      const ExactFraction beforeLower = task.hasBeenVisited
+        ? task.score.lower : ExactFraction::integer(-100'000'000);
+      const ExactFraction beforeUpper = task.hasBeenVisited
+        ? task.score.upper : ExactFraction::integer(100'000'000);
       if (!task.hasBeenVisited) task.score = fresh;
       else {
         BoundMergeResult merged = mergeSoundBounds(task.score, fresh);
@@ -1303,6 +1426,21 @@ struct ExactTurnSession {
       }
       task.score.action = { task.option };
       task.intervalWidth = remainingWidth(task.score);
+      if (consumedNodes > 0) {
+        const long double lowerGain = std::max(0.0L,
+          fractionApprox(task.score.lower) - fractionApprox(beforeLower));
+        const long double upperReduction = std::max(0.0L,
+          fractionApprox(beforeUpper) - fractionApprox(task.score.upper));
+        const long double perNodeLower = lowerGain / (long double)consumedNodes;
+        const long double perNodeUpper = upperReduction / (long double)consumedNodes;
+        task.lowerGainPerNode = task.hasPreviousBounds
+          ? (0.5L * task.lowerGainPerNode + 0.5L * perNodeLower) : perNodeLower;
+        task.upperReductionPerNode = task.hasPreviousBounds
+          ? (0.5L * task.upperReductionPerNode + 0.5L * perNodeUpper) : perNodeUpper;
+        task.hasPreviousBounds = true;
+      }
+      task.previousLower = task.score.lower;
+      task.previousUpper = task.score.upper;
       task.consumedNodes += consumedNodes;
       task.score.action = { task.option };
       task.hasBeenVisited = true;
@@ -1487,6 +1625,10 @@ struct ExactTurnSession {
         && queue.tasks[selectedIndex]->score.certified;
       decision.exactValueCertified =
         decision.bestActionCertified && decision.actionValueCertified;
+      decision.bestLower = decision.score.lower;
+      decision.maxChallengerUpper = hasOtherUpper
+        ? maxOtherUpper : ExactFraction::integer(-100'000'000);
+      decision.hasProofGap = true;
       if (!decision.bestActionCertified) decision.score.upper = maxUpper;
       decision.score.boundsSound = decision.score.boundsSound && allOtherBoundsSound;
       decision.score.certified = decision.exactValueCertified;
@@ -1496,8 +1638,10 @@ struct ExactTurnSession {
     decision.metrics.rootQueueReassignments += queue.reassignments;
     decision.metrics.rootQueueSteals += queue.steals;
     decision.metrics.rootQueueEliminations += queue.eliminations;
+    decision.metrics.argmaxDominatedCuts += queue.argmaxReadyStops;
 
-    if (decision.exactValueCertified && selectedIndex >= 0) {
+    if ((decision.exactValueCertified || decision.bestActionCertified)
+        && selectedIndex >= 0) {
       discardedMetrics = {};
       for (int i = 0; i < (int)queue.tasks.size(); ++i)
         if (i != selectedIndex)
@@ -1508,6 +1652,7 @@ struct ExactTurnSession {
       discardedMetrics.rootQueueSteals += queue.steals;
       discardedMetrics.rootQueueEliminations += queue.eliminations;
       discardedMetrics.boundContradictions += queue.boundContradictions;
+      discardedMetrics.argmaxDominatedCuts += queue.argmaxReadyStops;
       game = std::move(queue.tasks[selectedIndex]->game);
       planner = std::move(queue.tasks[selectedIndex]->planner);
       rootQueue.reset();
@@ -1635,27 +1780,32 @@ struct ExactTurnSession {
 					attempted = true;
 					if (output->planner->resourceStopped()) { resourceStopped = true; break; }
 				}
-				// Argmax certification (opt-in): stop once one root action's lower
-				// bound dominates every other action's upper bound.
-				if (output->planner->currentMetrics().certificationScope
-					== ExactSkeleton::CertScope::Argmax) {
+				// Argmax certification: stop once one root action's lower bound
+				// dominates every other action's upper bound. A point-valued
+				// incumbent is NOT required — that is exact-value proof.
+				{
 					int best = -1;
 					for (int option : assigned) {
-						if (output->actions[option].action.empty()) continue;
+						if (!output->visited[option] || output->actions[option].action.empty())
+							continue;
+						if (!output->actions[option].boundsSound) continue;
 						if (best < 0 || ExactCompare(output->actions[option].lower,
 							output->actions[best].lower) > 0) best = option;
 					}
-					if (best >= 0 && output->actions[best].certified) {
+					if (best >= 0) {
 						bool dominates = true;
 						for (int option : assigned) {
-							if (option == best || output->actions[option].action.empty()) continue;
-							if (ExactCompare(output->actions[best].lower, output->actions[option].upper) < 0) {
+							if (option == best) continue;
+							if (!output->visited[option] || !output->actions[option].boundsSound
+								|| output->actions[option].action.empty()) {
+								dominates = false; break;
+							}
+							if (ExactCompare(output->actions[best].lower,
+								output->actions[option].upper) < 0) {
 								dominates = false; break;
 							}
 						}
 						if (dominates) {
-							// Record the cut only. Do not mutate sibling upper bounds —
-							// tightening them to best.lower would falsify reported intervals.
 							output->argmaxCut = true;
 							break;
 						}
@@ -1765,6 +1915,10 @@ struct ExactTurnSession {
 			&& decision.score.boundsSound && decision.score.certified;
 		decision.exactValueCertified = decision.bestActionCertified
 			&& decision.actionValueCertified;
+		decision.bestLower = decision.score.lower;
+		decision.maxChallengerUpper = hasOtherUpper
+			? maxOtherUpper : ExactFraction::integer(-100'000'000);
+		decision.hasProofGap = true;
 		decision.score.upper = maxUpper;
 		decision.score.boundsSound = decision.score.boundsSound && allOtherBoundsSound;
 		decision.score.certified = decision.exactValueCertified;
@@ -1948,6 +2102,10 @@ struct ExactTurnSession {
 		&& queue.tasks[selectedIndex]->score.certified;
       decision.exactValueCertified = decision.bestActionCertified
 		&& decision.actionValueCertified;
+      decision.bestLower = decision.score.lower;
+      decision.maxChallengerUpper = hasOtherUpper
+        ? maxOtherUpper : ExactFraction::integer(-100'000'000);
+      decision.hasProofGap = true;
       if (!decision.bestActionCertified) decision.score.upper = maxUpper;
 		decision.score.boundsSound = decision.score.boundsSound && allOtherBoundsSound;
       decision.score.certified = decision.exactValueCertified;
@@ -1957,7 +2115,9 @@ struct ExactTurnSession {
     decision.metrics.rootQueueReassignments += queue.reassignments;
     decision.metrics.rootQueueSteals += queue.steals;
     decision.metrics.rootQueueEliminations += queue.eliminations;
-    if (decision.exactValueCertified && selectedIndex >= 0) {
+    decision.metrics.argmaxDominatedCuts += queue.argmaxReadyStops;
+    if ((decision.exactValueCertified || decision.bestActionCertified)
+        && selectedIndex >= 0) {
       discardedMetrics = {};
       for (int i = 0; i < (int)queue.tasks.size(); ++i)
         if (i != selectedIndex)
@@ -1968,6 +2128,7 @@ struct ExactTurnSession {
       discardedMetrics.rootQueueSteals += queue.steals;
       discardedMetrics.rootQueueEliminations += queue.eliminations;
       discardedMetrics.boundContradictions += queue.boundContradictions;
+      discardedMetrics.argmaxDominatedCuts += queue.argmaxReadyStops;
       game = std::move(queue.tasks[selectedIndex]->game);
       planner = std::move(queue.tasks[selectedIndex]->planner);
       rootQueue.reset();
@@ -2084,6 +2245,23 @@ static const char8_t* ExactProgressJson(ApiData* data, long long sessionId, cons
 	 j.appendCommaKeyValue("actionValueCertified", session.lastDecision.actionValueCertified);
 	 j.appendCommaKeyValue("bestActionCertified", session.lastDecision.bestActionCertified);
 	 j.appendCommaKeyValue("exactValueCertified", session.lastDecision.exactValueCertified);
+	 j.appendCommaKeyValue("hasProofGap", session.lastDecision.hasProofGap);
+	 j.appendCommaKey("bestLowerNumerator"); AppendExactNumerator(j, session.lastDecision.bestLower);
+	 j.appendCommaKey("bestLowerDenominator"); AppendExactDenominator(j, session.lastDecision.bestLower);
+	 j.appendCommaKey("maxChallengerUpperNumerator"); AppendExactNumerator(j, session.lastDecision.maxChallengerUpper);
+	 j.appendCommaKey("maxChallengerUpperDenominator"); AppendExactDenominator(j, session.lastDecision.maxChallengerUpper);
+	 {
+		auto approx = [](const ExactFraction& value) -> long double {
+			if (!value.valid) return 0.0L;
+			if (value.big) return 100'000'000.0L;
+			return (long double)value.numerator / (long double)value.denominator;
+		};
+		const long double gap = session.lastDecision.hasProofGap
+			? (approx(session.lastDecision.maxChallengerUpper) - approx(session.lastDecision.bestLower))
+			: 0.0L;
+		j.appendCommaKey("proofGap");
+		AppendLongLong(j, (long long)std::llround((double)gap));
+	 }
 	 j.appendCommaKeyValue("resumable", !metrics.structurallyBlocked
 		&& metrics.boundContradictions == 0
 		&& !session.lastDecision.bestActionCertified

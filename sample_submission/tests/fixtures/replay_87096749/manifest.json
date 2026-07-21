@@ -1,0 +1,146 @@
+[
+  {
+    "file": "agent0_step011.json",
+    "agent": 0,
+    "step": 11,
+    "turn": 2,
+    "context": 0,
+    "selectType": 0,
+    "options": 9
+  },
+  {
+    "file": "agent0_step034.json",
+    "agent": 0,
+    "step": 34,
+    "turn": 4,
+    "context": 0,
+    "selectType": 0,
+    "options": 8
+  },
+  {
+    "file": "agent0_step050.json",
+    "agent": 0,
+    "step": 50,
+    "turn": 6,
+    "context": 0,
+    "selectType": 0,
+    "options": 13
+  },
+  {
+    "file": "agent0_step063.json",
+    "agent": 0,
+    "step": 63,
+    "turn": 8,
+    "context": 0,
+    "selectType": 0,
+    "options": 21
+  },
+  {
+    "file": "agent0_step103.json",
+    "agent": 0,
+    "step": 103,
+    "turn": 10,
+    "context": 0,
+    "selectType": 0,
+    "options": 19
+  },
+  {
+    "file": "agent0_step132.json",
+    "agent": 0,
+    "step": 132,
+    "turn": 12,
+    "context": 0,
+    "selectType": 0,
+    "options": 21
+  },
+  {
+    "file": "agent0_step150.json",
+    "agent": 0,
+    "step": 150,
+    "turn": 14,
+    "context": 0,
+    "selectType": 0,
+    "options": 19
+  },
+  {
+    "file": "agent0_step166.json",
+    "agent": 0,
+    "step": 166,
+    "turn": 16,
+    "context": 0,
+    "selectType": 0,
+    "options": 9
+  },
+  {
+    "file": "agent1_step005.json",
+    "agent": 1,
+    "step": 5,
+    "turn": 1,
+    "context": 0,
+    "selectType": 0,
+    "options": 4
+  },
+  {
+    "file": "agent1_step023.json",
+    "agent": 1,
+    "step": 23,
+    "turn": 3,
+    "context": 0,
+    "selectType": 0,
+    "options": 5
+  },
+  {
+    "file": "agent1_step047.json",
+    "agent": 1,
+    "step": 47,
+    "turn": 5,
+    "context": 0,
+    "selectType": 0,
+    "options": 11
+  },
+  {
+    "file": "agent1_step060.json",
+    "agent": 1,
+    "step": 60,
+    "turn": 7,
+    "context": 0,
+    "selectType": 0,
+    "options": 17
+  },
+  {
+    "file": "agent1_step073.json",
+    "agent": 1,
+    "step": 73,
+    "turn": 9,
+    "context": 0,
+    "selectType": 0,
+    "options": 16
+  },
+  {
+    "file": "agent1_step123.json",
+    "agent": 1,
+    "step": 123,
+    "turn": 11,
+    "context": 0,
+    "selectType": 0,
+    "options": 4
+  },
+  {
+    "file": "agent1_step135.json",
+    "agent": 1,
+    "step": 135,
+    "turn": 13,
+    "context": 0,
+    "selectType": 0,
+    "options": 5
+  },
+  {
+    "file": "agent1_step153.json",
+    "agent": 1,
+    "step": 153,
+    "turn": 15,
+    "context": 0,
+    "selectType": 0,
+    "options": 7
+  }
+]
